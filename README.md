@@ -11,7 +11,9 @@ the background.
 
 ## What it does
 
-- 🎚️ **Converts** FLAC → MP3 320 kbps (keeps tags + cover art); MP3/M4A are sent as‑is
+- 🎚️ **Converts** FLAC → MP3 320 kbps, **44.1 kHz stereo**; keeps tags but **strips
+  embedded cover art** (oversized covers + mixed sample rates make some lightweight
+  Wear OS players play tracks at the wrong speed). MP3 input is cover‑stripped losslessly.
 - ⌚ **Finds** the watch automatically over Wi‑Fi (mDNS) — pair once, then hands‑off
 - ♻️ **Auto‑syncs** a music folder via a `launchd` agent (on change + every 5 min)
 - 🗑️ **Mirrors** deletions (remove a song locally → it leaves the watch too)

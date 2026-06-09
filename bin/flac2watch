@@ -103,27 +103,35 @@ discover_watch() {
 }
 
 # --- conversion -------------------------------------------------------------
-# Builds an MP3 for a FLAC into the cache, only if missing or stale.
-# echoes the path of the playable mp3 for a given source file.
+# Produces a watch-friendly MP3 in the cache for any source file, only if
+# missing or stale, and echoes its path.
+#
+# Important: embedded cover art is intentionally STRIPPED, and audio is forced
+# to 44.1 kHz / stereo. Oversized cover art and mixed sample rates make some
+# lightweight Wear OS players play tracks at the wrong speed; a clean, uniform
+# audio-only stream avoids that.
 mp3_for() {
   local src="$1" rel="$2"
-  case "$src" in
-    *.flac|*.FLAC)
-      local out="$MP3_CACHE/${rel%.*}.mp3"
-      if [ ! -f "$out" ] || [ "$src" -nt "$out" ]; then
-        mkdir -p "$(dirname "$out")"
+  local out="$MP3_CACHE/${rel%.*}.mp3"
+  if [ ! -f "$out" ] || [ "$src" -nt "$out" ]; then
+    mkdir -p "$(dirname "$out")"
+    case "$src" in
+      *.mp3|*.MP3)
+        # already MP3 — just drop the cover, keep audio bit-identical (lossless)
         ffmpeg -y -nostdin -loglevel error -i "$src" \
-          -map 0:a:0 -map '0:v?' -c:a libmp3lame -b:a "$BITRATE" -c:v copy \
-          -id3v2_version 3 -map_metadata 0 "$out" 2>/dev/null \
-        || ffmpeg -y -nostdin -loglevel error -i "$src" \
-          -map 0:a:0 -c:a libmp3lame -b:a "$BITRATE" \
+          -map 0:a:0 -c:a copy -id3v2_version 3 -map_metadata 0 "$out" 2>/dev/null \
+        || cp "$src" "$out"
+        ;;
+      *)
+        # FLAC / M4A / … → MP3, no cover, normalized to 44.1 kHz stereo
+        ffmpeg -y -nostdin -loglevel error -i "$src" \
+          -map 0:a:0 -c:a libmp3lame -b:a "$BITRATE" -ar 44100 -ac 2 \
           -id3v2_version 3 -map_metadata 0 "$out" 2>/dev/null \
         || { err "Konvertierung fehlgeschlagen: $rel"; return 1; }
-      fi
-      printf "%s" "$out"
-      ;;
-    *) printf "%s" "$src" ;;   # already mp3/m4a — play as-is
-  esac
+        ;;
+    esac
+  fi
+  printf "%s" "$out"
 }
 
 # --- main commands ----------------------------------------------------------
@@ -184,13 +192,10 @@ cmd_sync() {
   local src rel target playable remote
   while IFS= read -r -d '' src; do
     rel="${src#"$LIBRARY"/}"
-    case "$src" in
-      *.flac|*.FLAC) target="${rel%.*}.mp3" ;;
-      *)             target="$rel" ;;
-    esac
+    target="${rel%.*}.mp3"   # everything is normalized to .mp3
     printf "%s\n" "$target" >>"$want"
     if ! grep -Fxq "$target" "$on_watch"; then
-      case "$src" in *.flac|*.FLAC) converted=$((converted+1));; esac
+      case "$src" in *.flac|*.FLAC|*.m4a|*.M4A) converted=$((converted+1));; esac
       playable=$(mp3_for "$src" "$rel") || { failed=$((failed+1)); continue; }
       remote="$WATCH_DIR/$target"
       adb $W shell "mkdir -p \"$(dirname "$remote")\"" >/dev/null 2>&1
