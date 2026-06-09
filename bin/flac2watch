@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+#
+# flac2watch — convert a music folder to MP3 and auto-sync it to a
+# Wear OS / Galaxy Watch over Wi-Fi (adb). No Bluetooth, no Galaxy Wearable.
+#
+# Commands:
+#   flac2watch pair              one-time: pair the Mac with the watch
+#   flac2watch sync [--notify]   convert new files + push everything missing to the watch
+#   flac2watch status            show config, watch reachability, song counts
+#   flac2watch doctor            check requirements and connection
+#   flac2watch open              reveal the music library folder in Finder
+#
+# Config lives in ~/.config/flac2watch/config (shell key=value).
+#
+set -uo pipefail
+
+# Ensure Homebrew tools (adb, ffmpeg) are found even when launched from a GUI
+# app or launchd, which start with a minimal PATH.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+# --- paths / defaults -------------------------------------------------------
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flac2watch"
+CONFIG_FILE="$CONFIG_DIR/config"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flac2watch"
+MP3_CACHE="$CACHE_DIR/mp3"
+LOG_FILE="$CACHE_DIR/flac2watch.log"
+
+LIBRARY_DEFAULT="$HOME/Music/WatchSync"
+WATCH_DIR="/sdcard/Music/FLAC2Watch"   # destination folder on the watch
+BITRATE="320k"
+MIRROR_DELETE="true"                   # remove from watch what was removed locally
+PLAYER_PKG="com.samsung.android.wearable.music"
+
+# Loaded from config:
+LIBRARY="$LIBRARY_DEFAULT"
+WATCH_NAME=""   # the paired adb mdns service name, e.g. adb-RFGL...-xxxx
+
+# --- pretty output ----------------------------------------------------------
+if [ -t 1 ]; then
+  B=$'\033[1m'; DIM=$'\033[2m'; G=$'\033[32m'; Y=$'\033[33m'; R=$'\033[31m'; C=$'\033[36m'; X=$'\033[0m'
+else
+  B=""; DIM=""; G=""; Y=""; R=""; C=""; X=""
+fi
+say()  { printf "%s\n" "$*"; }
+ok()   { printf "${G}✓${X} %s\n" "$*"; }
+warn() { printf "${Y}!${X} %s\n" "$*"; }
+err()  { printf "${R}✗${X} %s\n" "$*" >&2; }
+log()  { mkdir -p "$CACHE_DIR"; printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"; }
+
+NOTIFY=false
+notify() { # title, message — macOS notification when --notify is set
+  $NOTIFY || return 0
+  /usr/bin/osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
+}
+
+# --- config -----------------------------------------------------------------
+load_config() {
+  if [ -f "$CONFIG_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$CONFIG_FILE"
+  fi
+}
+save_config() {
+  mkdir -p "$CONFIG_DIR"
+  {
+    printf 'LIBRARY=%q\n' "$LIBRARY"
+    printf 'WATCH_NAME=%q\n' "$WATCH_NAME"
+    printf 'BITRATE=%q\n' "$BITRATE"
+    printf 'MIRROR_DELETE=%q\n' "$MIRROR_DELETE"
+  } >"$CONFIG_FILE"
+}
+
+require() {
+  command -v "$1" >/dev/null 2>&1 || { err "'$1' fehlt. Bitte installieren (z.B. brew install $2)."; return 1; }
+}
+
+# --- watch discovery / connection ------------------------------------------
+# Echoes the connect endpoint (ip:port) on success, empty on failure.
+discover_watch() {
+  adb start-server >/dev/null 2>&1
+  local line svc
+  # Prefer the paired device by its mdns service name.
+  while IFS= read -r line; do
+    svc=$(printf "%s" "$line" | awk '/_adb-tls-connect\._tcp/{print $1}')
+    [ -z "$svc" ] && continue
+    if [ -z "$WATCH_NAME" ] || [ "$svc" = "$WATCH_NAME" ]; then
+      local endpoint
+      endpoint=$(printf "%s" "$line" | awk '/_adb-tls-connect\._tcp/{print $NF}')
+      if [ -n "$endpoint" ]; then
+        adb connect "$endpoint" >/dev/null 2>&1
+        # verify it's really a watch (model SM-L… / Wear)
+        if adb -s "$endpoint" shell getprop ro.build.characteristics 2>/dev/null | grep -qi watch; then
+          printf "%s" "$endpoint"; return 0
+        fi
+        # fallback: accept if we matched the saved name
+        if [ -n "$WATCH_NAME" ] && [ "$svc" = "$WATCH_NAME" ]; then
+          printf "%s" "$endpoint"; return 0
+        fi
+      fi
+    fi
+  done < <(adb mdns services 2>/dev/null)
+  return 1
+}
+
+# --- conversion -------------------------------------------------------------
+# Builds an MP3 for a FLAC into the cache, only if missing or stale.
+# echoes the path of the playable mp3 for a given source file.
+mp3_for() {
+  local src="$1" rel="$2"
+  case "$src" in
+    *.flac|*.FLAC)
+      local out="$MP3_CACHE/${rel%.*}.mp3"
+      if [ ! -f "$out" ] || [ "$src" -nt "$out" ]; then
+        mkdir -p "$(dirname "$out")"
+        ffmpeg -y -nostdin -loglevel error -i "$src" \
+          -map 0:a:0 -map '0:v?' -c:a libmp3lame -b:a "$BITRATE" -c:v copy \
+          -id3v2_version 3 -map_metadata 0 "$out" 2>/dev/null \
+        || ffmpeg -y -nostdin -loglevel error -i "$src" \
+          -map 0:a:0 -c:a libmp3lame -b:a "$BITRATE" \
+          -id3v2_version 3 -map_metadata 0 "$out" 2>/dev/null \
+        || { err "Konvertierung fehlgeschlagen: $rel"; return 1; }
+      fi
+      printf "%s" "$out"
+      ;;
+    *) printf "%s" "$src" ;;   # already mp3/m4a — play as-is
+  esac
+}
+
+# --- main commands ----------------------------------------------------------
+cmd_pair() {
+  require adb android-platform-tools || exit 1
+  say "${B}flac2watch — Uhr koppeln${X}"
+  say ""
+  say "Auf der ${B}Galaxy Watch${X}:"
+  say "  1. Einstellungen → Uhr-Info → Softwareinformationen → 7× auf 'Softwareversion' tippen"
+  say "  2. Einstellungen → Entwickleroptionen → ${B}ADB-Debugging${X} + ${B}Drahtloses Debugging${X} an"
+  say "  3. Uhr ins ${B}selbe WLAN${X} wie dieser Mac"
+  say "  4. Drahtloses Debugging → ${B}'Gerät koppeln'${X} antippen (zeigt IP:Port + 6-stelligen Code)"
+  say ""
+  printf "IP:Port (z.B. 192.168.1.77:46151): "; read -r addr
+  printf "Kopplungscode (6-stellig):          "; read -r code
+  say ""
+  if ! adb pair "$addr" "$code"; then
+    err "Kopplung fehlgeschlagen. Code/Port ändern sich — Bildschirm offen lassen und neu versuchen."
+    exit 1
+  fi
+  ok "Gekoppelt."
+  # Find and remember the watch's mdns service name.
+  sleep 1
+  local name
+  name=$(adb mdns services 2>/dev/null | awk '/_adb-tls-connect\._tcp/{print $1; exit}')
+  if [ -n "$name" ]; then WATCH_NAME="$name"; ok "Uhr gemerkt: $name"; fi
+  [ -d "$LIBRARY" ] || mkdir -p "$LIBRARY"
+  save_config
+  say ""
+  ok "Fertig. Lege Musik in ${B}$LIBRARY${X} und führe ${C}flac2watch sync${X} aus (oder nutze die App / den Auto-Sync)."
+}
+
+cmd_sync() {
+  require ffmpeg ffmpeg || exit 1
+  require adb android-platform-tools || exit 1
+  [ -d "$LIBRARY" ] || mkdir -p "$LIBRARY"
+
+  local endpoint
+  endpoint=$(discover_watch) || {
+    log "watch not reachable"
+    warn "Uhr nicht erreichbar (WLAN aus, nicht im Netz, oder Drahtloses Debugging aus)."
+    notify "FLAC2Watch" "Uhr nicht erreichbar – Sync wartet."
+    exit 0   # quiet success so the background agent doesn't error-spam
+  }
+  local W="-s $endpoint"
+  ok "Uhr verbunden ($endpoint)"
+
+  # What's already on the watch?
+  adb $W shell "mkdir -p '$WATCH_DIR'" >/dev/null 2>&1
+  local on_watch; on_watch="$CACHE_DIR/on_watch.list"
+  mkdir -p "$CACHE_DIR"
+  adb $W shell "find '$WATCH_DIR' -type f -name '*.mp3'" 2>/dev/null \
+    | sed "s#^$WATCH_DIR/##" | sort >"$on_watch"
+
+  # Build target list from the library.
+  local want; want="$CACHE_DIR/want.list"; : >"$want"
+  local pushed=0 converted=0 failed=0 scan="$CACHE_DIR/scan.list"; : >"$scan"
+  local src rel target playable remote
+  while IFS= read -r -d '' src; do
+    rel="${src#"$LIBRARY"/}"
+    case "$src" in
+      *.flac|*.FLAC) target="${rel%.*}.mp3" ;;
+      *)             target="$rel" ;;
+    esac
+    printf "%s\n" "$target" >>"$want"
+    if ! grep -Fxq "$target" "$on_watch"; then
+      case "$src" in *.flac|*.FLAC) converted=$((converted+1));; esac
+      playable=$(mp3_for "$src" "$rel") || { failed=$((failed+1)); continue; }
+      remote="$WATCH_DIR/$target"
+      adb $W shell "mkdir -p \"$(dirname "$remote")\"" >/dev/null 2>&1
+      if adb $W push "$playable" "$remote" >/dev/null 2>&1; then
+        pushed=$((pushed+1))
+        printf "%s\n" "$remote" >>"$scan"
+        say "  ${G}+${X} $target"
+      else
+        failed=$((failed+1)); err "Push fehlgeschlagen: $target"
+      fi
+    fi
+  done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0)
+
+  # Mirror deletions (only inside our own watch folder).
+  local removed=0
+  if [ "$MIRROR_DELETE" = "true" ] && [ -s "$on_watch" ]; then
+    sort -o "$want" "$want"
+    while IFS= read -r target; do
+      [ -z "$target" ] && continue
+      if ! grep -Fxq "$target" "$want"; then
+        adb $W shell "rm -f \"$WATCH_DIR/$target\"" >/dev/null 2>&1 && removed=$((removed+1))
+      fi
+    done <"$on_watch"
+  fi
+
+  # Trigger media scan for newly pushed files.
+  if [ -s "$scan" ]; then
+    while IFS= read -r remote; do
+      adb $W shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d \"file://$remote\"" >/dev/null 2>&1
+    done <"$scan"
+  fi
+
+  # Player check.
+  local have_player="yes"
+  adb $W shell pm path "$PLAYER_PKG" >/dev/null 2>&1 || have_player="no"
+
+  say ""
+  if [ "$pushed" -gt 0 ] || [ "$removed" -gt 0 ]; then
+    ok "Sync fertig: ${B}$pushed${X} neu, $removed entfernt$( [ "$failed" -gt 0 ] && printf ", %s Fehler" "$failed")."
+    notify "FLAC2Watch" "$pushed Songs auf die Uhr gesynct."
+    log "synced: +$pushed -$removed fail=$failed"
+  else
+    ok "Schon aktuell — nichts zu tun."
+    log "already up to date"
+  fi
+
+  if [ "$have_player" = "no" ]; then
+    say ""
+    warn "Auf der Uhr ist noch kein Musik-Player installiert."
+    say "   Öffne Play Store auf der Uhr → 'Music for Galaxy Watch':"
+    say "   ${C}flac2watch player${X}   (öffnet die App-Seite auf der Uhr)"
+    notify "FLAC2Watch" "Musik-Player auf der Uhr fehlt – siehe Terminal."
+  fi
+}
+
+cmd_player() {
+  require adb android-platform-tools || exit 1
+  local endpoint; endpoint=$(discover_watch) || { err "Uhr nicht erreichbar."; exit 1; }
+  adb -s "$endpoint" shell am start -a android.intent.action.VIEW -d "market://details?id=$PLAYER_PKG" >/dev/null 2>&1 \
+    && ok "Play-Store-Seite auf der Uhr geöffnet → dort 'Installieren' tippen." \
+    || err "Konnte Play Store nicht öffnen."
+}
+
+cmd_status() {
+  say "${B}flac2watch — Status${X}"
+  say "  Bibliothek : $LIBRARY"
+  local n; n=$(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null | wc -l | tr -d ' ')
+  say "  Songs lokal: $n"
+  say "  Uhr gemerkt: ${WATCH_NAME:-<noch nicht gekoppelt>}"
+  local endpoint
+  if endpoint=$(discover_watch); then
+    ok "Uhr erreichbar ($endpoint)"
+    local w; w=$(adb -s "$endpoint" shell "find '$WATCH_DIR' -type f -name '*.mp3' 2>/dev/null | wc -l" 2>/dev/null | tr -d ' \r')
+    say "  Songs auf Uhr: ${w:-0}"
+  else
+    warn "Uhr nicht erreichbar (Drahtloses Debugging an? selbes WLAN?)"
+  fi
+}
+
+cmd_doctor() {
+  say "${B}flac2watch — Doctor${X}"
+  for t in ffmpeg adb; do
+    if command -v "$t" >/dev/null 2>&1; then ok "$t: $(command -v "$t")"; else err "$t fehlt"; fi
+  done
+  [ -d "$LIBRARY" ] && ok "Bibliothek: $LIBRARY" || warn "Bibliothek fehlt: $LIBRARY (lege ich beim Sync an)"
+  [ -n "$WATCH_NAME" ] && ok "Gekoppelt: $WATCH_NAME" || warn "Noch nicht gekoppelt → 'flac2watch pair'"
+  if discover_watch >/dev/null; then ok "Uhr erreichbar"; else warn "Uhr nicht erreichbar"; fi
+}
+
+usage() {
+  cat <<EOF
+${B}flac2watch${X} — Musik per WLAN auf die Galaxy Watch syncen
+
+  ${C}flac2watch pair${X}             Uhr einmalig koppeln
+  ${C}flac2watch sync${X} [--notify]  Konvertieren + alles Fehlende auf die Uhr pushen
+  ${C}flac2watch status${X}           Status anzeigen
+  ${C}flac2watch player${X}           Musik-Player-Seite auf der Uhr öffnen
+  ${C}flac2watch doctor${X}           Voraussetzungen prüfen
+  ${C}flac2watch open${X}             Musik-Ordner im Finder öffnen
+
+  Musik-Ordner: ${LIBRARY}
+EOF
+}
+
+# --- dispatch ---------------------------------------------------------------
+load_config
+for a in "$@"; do [ "$a" = "--notify" ] && NOTIFY=true; done
+
+case "${1:-}" in
+  pair)        cmd_pair ;;
+  sync)        cmd_sync ;;
+  player)      cmd_player ;;
+  status)      cmd_status ;;
+  doctor)      cmd_doctor ;;
+  open)        open "$LIBRARY" 2>/dev/null || { mkdir -p "$LIBRARY"; open "$LIBRARY"; } ;;
+  ""|-h|--help|help) usage ;;
+  *) err "Unbekannter Befehl: $1"; usage; exit 1 ;;
+esac

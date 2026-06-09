@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Auto-sync LaunchAgent for flac2watch.
+  NOTE: __BIN__ and __LIBRARY__ are placeholders. install.sh writes a copy
+  with the real paths to ~/Library/LaunchAgents/ and loads it.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.lordhayne.flac2watch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__</string>
+        <string>sync</string>
+        <string>--notify</string>
+    </array>
+
+    <!-- Re-sync whenever the music library changes… -->
+    <key>WatchPaths</key>
+    <array>
+        <string>__LIBRARY__</string>
+    </array>
+
+    <!-- …and every 5 minutes, to catch the watch coming back onto Wi-Fi. -->
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+</dict>
+</plist>
