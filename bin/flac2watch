@@ -171,10 +171,11 @@ cmd_sync() {
 
   local endpoint
   endpoint=$(discover_watch) || {
+    # Watch offline is the normal idle state — stay completely silent so the
+    # background agent never spams notifications. (Only printed when run by hand.)
     log "watch not reachable"
     warn "Uhr nicht erreichbar (WLAN aus, nicht im Netz, oder Drahtloses Debugging aus)."
-    notify "FLAC2Watch" "Uhr nicht erreichbar – Sync wartet."
-    exit 0   # quiet success so the background agent doesn't error-spam
+    exit 0
   }
   local W="-s $endpoint"
   ok "Uhr verbunden ($endpoint)"
@@ -247,7 +248,8 @@ cmd_sync() {
     warn "Auf der Uhr ist noch kein Musik-Player installiert."
     say "   Öffne Play Store auf der Uhr → 'Music for Galaxy Watch':"
     say "   ${C}flac2watch player${X}   (öffnet die App-Seite auf der Uhr)"
-    notify "FLAC2Watch" "Musik-Player auf der Uhr fehlt – siehe Terminal."
+    # Only nag about the missing player when we actually pushed something.
+    [ "$pushed" -gt 0 ] && notify "FLAC2Watch" "Musik-Player auf der Uhr fehlt – siehe Terminal."
   fi
 }
 
