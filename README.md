@@ -17,13 +17,18 @@ the background.
 - ⌚ **Finds** the watch automatically over Wi‑Fi (mDNS) — pair once, then hands‑off
 - ♻️ **Auto‑syncs** a music folder via a `launchd` agent (on change + every 5 min)
 - 🗑️ **Mirrors** deletions (remove a song locally → it leaves the watch too)
-- 🖱️ **Drag & drop app** to add music; or just drop files in the folder in Finder
+- 🖥️ **Companion app** (native SwiftUI, dark Liquid-Glass UI) — watch status,
+  song counts, pending badge, battery & free storage, drag & drop, one‑click
+  sync with progress bar, song list with delete, settings, pairing dialog
+- 📍 **Menu bar companion** — watch status + pending count in the menu bar,
+  sync from anywhere; closing the window keeps it running
 
 ## Requirements
 
 - macOS with [Homebrew](https://brew.sh)
 - `brew install ffmpeg`
 - `brew install --cask android-platform-tools` (gives you `adb`)
+- Xcode Command Line Tools (`xcode-select --install`) — already there if Homebrew works
 - A Wear OS watch (built/tested on a **Galaxy Watch 8, SM‑L320**)
 
 ## Install
@@ -34,8 +39,8 @@ cd flac2watch
 ./install.sh
 ```
 
-This installs the `flac2watch` CLI, builds the **FLAC2Watch** drag‑and‑drop app
-into `~/Applications`, and loads the auto‑sync agent.
+This installs the `flac2watch` CLI, builds the **FLAC2Watch** app into
+`~/Applications`, and loads the auto‑sync agent.
 
 ## First‑time setup (pair the watch)
 
@@ -52,19 +57,30 @@ Then on the Mac:
 flac2watch pair        # enter the IP:Port and code shown on the watch
 ```
 
+…or open the **FLAC2Watch** app and click **Uhr koppeln** — same thing, with
+text fields instead of a terminal.
+
 Pairing is **one‑time** — the Mac remembers the watch and reconnects on its own.
 
 ## Use
 
-Just put music into **`~/Music/WatchSync`** (drag onto the **FLAC2Watch** app, or
-copy in Finder). The auto‑sync agent pushes it whenever the watch is reachable.
+Just put music into **`~/Music/WatchSync`** (drop it into the **FLAC2Watch** app
+window, drag it onto its Dock icon, or copy in Finder). The auto‑sync agent
+pushes it whenever the watch is reachable.
+
+The **FLAC2Watch** app shows whether the watch is reachable, how many songs are
+local vs. on the watch, and has a **Jetzt syncen** button when you don't want
+to wait for the auto‑sync.
 
 Manual control:
 
 ```sh
 flac2watch sync        # convert + push everything missing, now
 flac2watch status      # library + watch song counts, reachability
-flac2watch player      # open the music‑player app page on the watch
+flac2watch list        # songs currently on the watch
+flac2watch launch      # start the music player on the watch
+flac2watch player      # open the player's install page on the watch
+flac2watch config set  # bitrate | mirror_delete | library
 flac2watch doctor      # check requirements & connection
 flac2watch open        # reveal the music folder in Finder
 ```
@@ -79,6 +95,8 @@ everything `flac2watch` pushed. Pair Bluetooth earbuds and the phone can stay ho
 ## Honest limitations (Wear OS, not us)
 
 - The watch must have **Wireless debugging on** and be on the **same Wi‑Fi**.
+- The watch's Wi‑Fi **naps when its screen is off** — if it shows as unreachable,
+  wake the watch (raise wrist / tap the screen) and it reappears within seconds.
 - After a **watch reboot**, wireless debugging turns itself off — re‑enable it in
   Developer options. No need to pair again; sync resumes automatically.
 

@@ -9,7 +9,7 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 BIN_SRC="$REPO/bin/flac2watch"
-APP_SRC="$REPO/app/FLAC2Watch.applescript"
+APP_SWIFT="$REPO/app/FLAC2Watch.swift"
 PLIST_SRC="$REPO/launchd/com.lordhayne.flac2watch.plist"
 
 BIN_DIR="$HOME/.local/bin"
@@ -17,7 +17,7 @@ BIN_DST="$BIN_DIR/flac2watch"
 APP_DIR="$HOME/Applications"
 APP_DST="$APP_DIR/FLAC2Watch.app"
 LIBRARY="$HOME/Music/WatchSync"
-LOG="$HOME/.cache/flac2watch/flac2watch.log"
+LOG="$HOME/.cache/flac2watch/agent.log"   # agent stdout — getrennt vom CLI-Log
 AGENT_DIR="$HOME/Library/LaunchAgents"
 AGENT_DST="$AGENT_DIR/com.lordhayne.flac2watch.plist"
 
@@ -37,7 +37,11 @@ if [ "$miss" = 1 ]; then
   echo "  Bitte installieren:  brew install ffmpeg && brew install --cask android-platform-tools"
   exit 1
 fi
-ok "ffmpeg & adb vorhanden"
+if ! command -v swiftc >/dev/null 2>&1; then
+  printf "${Y}!${X} swiftc fehlt (wird für die App gebraucht). Bitte:  xcode-select --install\n"
+  exit 1
+fi
+ok "ffmpeg, adb & swiftc vorhanden"
 
 # 2. CLI --------------------------------------------------------------------
 mkdir -p "$BIN_DIR" "$LIBRARY" "$(dirname "$LOG")"
@@ -49,10 +53,14 @@ if [ -w /opt/homebrew/bin ]; then
   ok "Symlink: /opt/homebrew/bin/flac2watch (im PATH)"
 fi
 
-# 3. Drag & drop app --------------------------------------------------------
+# 3. App (native SwiftUI) -----------------------------------------------------
 mkdir -p "$APP_DIR"
 rm -rf "$APP_DST"
-osacompile -o "$APP_DST" "$APP_SRC"
+mkdir -p "$APP_DST/Contents/MacOS" "$APP_DST/Contents/Resources"
+cp "$REPO/app/Info.plist" "$APP_DST/Contents/Info.plist"
+[ -f "$REPO/app/FLAC2Watch.icns" ] && cp "$REPO/app/FLAC2Watch.icns" "$APP_DST/Contents/Resources/"
+swiftc -O -parse-as-library "$APP_SWIFT" -o "$APP_DST/Contents/MacOS/FLAC2Watch"
+codesign --force --sign - "$APP_DST" >/dev/null 2>&1 || true
 ok "App gebaut: $APP_DST"
 
 # 4. Auto-sync LaunchAgent --------------------------------------------------
