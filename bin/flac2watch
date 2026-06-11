@@ -33,7 +33,8 @@ PLAYER_PKG="com.samsung.android.wearable.music"
 
 # Loaded from config:
 LIBRARY="$LIBRARY_DEFAULT"
-WATCH_NAME=""   # the paired adb mdns service name, e.g. adb-RFGL...-xxxx
+WATCH_NAME=""     # the paired adb mdns service name, e.g. adb-RFGL...-xxxx
+LAST_ENDPOINT=""  # adb serial (ip:port) that worked last time
 
 # --- pretty output ----------------------------------------------------------
 if [ -t 1 ]; then
@@ -48,6 +49,7 @@ err()  { printf "${R}✗${X} %s\n" "$*" >&2; }
 log()  { mkdir -p "$CACHE_DIR"; printf "%s %s\n" "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE"; }
 
 NOTIFY=false
+PROGRESS=false   # machine-readable TOTAL/PROGRESS lines for the app (--progress)
 notify() { # title, message — macOS notification when --notify is set
   $NOTIFY || return 0
   /usr/bin/osascript -e "display notification \"$2\" with title \"$1\"" >/dev/null 2>&1 || true
@@ -65,6 +67,7 @@ save_config() {
   {
     printf 'LIBRARY=%q\n' "$LIBRARY"
     printf 'WATCH_NAME=%q\n' "$WATCH_NAME"
+    printf 'LAST_ENDPOINT=%q\n' "$LAST_ENDPOINT"
     printf 'BITRATE=%q\n' "$BITRATE"
     printf 'MIRROR_DELETE=%q\n' "$MIRROR_DELETE"
   } >"$CONFIG_FILE"
@@ -75,31 +78,91 @@ require() {
 }
 
 # --- watch discovery / connection ------------------------------------------
-# Echoes the connect endpoint (ip:port) on success, empty on failure.
+# Echoes the watch's adb serial (ip:port) on success, empty on failure.
+#
+# `adb mdns services` is a momentary snapshot and frequently returns nothing
+# even though the watch is right there — so try the cheap, reliable signals
+# first: an already-connected device, then the endpoint that worked last
+# time, and only then fall back to (repeated) mdns scans.
+
+# NB: every adb call inside a while-read loop needs </dev/null — adb forwards
+# its stdin to the device and would otherwise swallow the rest of the list
+# being read (symptom: loop stops after the first item).
+is_watch() { # serial → 0 if the device identifies as a watch
+  adb -s "$1" shell getprop ro.build.characteristics </dev/null 2>/dev/null | grep -qi watch
+}
+
+remember_endpoint() { # persist the serial that worked, for the next run
+  [ "$LAST_ENDPOINT" = "$1" ] && return 0
+  LAST_ENDPOINT="$1"
+  save_config
+}
+
 discover_watch() {
   adb start-server >/dev/null 2>&1
-  local line svc
-  # Prefer the paired device by its mdns service name.
-  while IFS= read -r line; do
-    svc=$(printf "%s" "$line" | awk '/_adb-tls-connect\._tcp/{print $1}')
-    [ -z "$svc" ] && continue
-    if [ -z "$WATCH_NAME" ] || [ "$svc" = "$WATCH_NAME" ]; then
-      local endpoint
-      endpoint=$(printf "%s" "$line" | awk '/_adb-tls-connect\._tcp/{print $NF}')
-      if [ -n "$endpoint" ]; then
-        adb connect "$endpoint" >/dev/null 2>&1
+  local serial line svc endpoint try
+
+  # 1) Already connected from a previous status/sync?
+  while IFS= read -r serial; do
+    if is_watch "$serial"; then
+      remember_endpoint "$serial"; printf "%s" "$serial"; return 0
+    fi
+  done < <(adb devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}')
+
+  # 2) The endpoint that worked last time. Probe with a 2s TCP check first —
+  #    `adb connect` against a napping watch blocks for a long time, and the
+  #    port is re-randomized on wake anyway.
+  if [ -n "$LAST_ENDPOINT" ]; then
+    if nc -z -G 2 "${LAST_ENDPOINT%:*}" "${LAST_ENDPOINT##*:}" >/dev/null 2>&1; then
+      adb connect "$LAST_ENDPOINT" </dev/null >/dev/null 2>&1
+      if is_watch "$LAST_ENDPOINT"; then
+        printf "%s" "$LAST_ENDPOINT"; return 0
+      fi
+      adb disconnect "$LAST_ENDPOINT" </dev/null >/dev/null 2>&1
+    fi
+  fi
+
+  # 3) mdns scan — retried, the snapshot often comes back empty.
+  for try in 1 2 3; do
+    while IFS= read -r line; do
+      svc=$(printf "%s" "$line" | awk '{print $1}')
+      [ -z "$svc" ] && continue
+      if [ -z "$WATCH_NAME" ] || [ "$svc" = "$WATCH_NAME" ]; then
+        endpoint=$(printf "%s" "$line" | awk '{print $NF}')
+        [ -z "$endpoint" ] && continue
+        adb connect "$endpoint" </dev/null >/dev/null 2>&1
         # verify it's really a watch (model SM-L… / Wear)
-        if adb -s "$endpoint" shell getprop ro.build.characteristics 2>/dev/null | grep -qi watch; then
-          printf "%s" "$endpoint"; return 0
+        if is_watch "$endpoint"; then
+          remember_endpoint "$endpoint"; printf "%s" "$endpoint"; return 0
         fi
         # fallback: accept if we matched the saved name
         if [ -n "$WATCH_NAME" ] && [ "$svc" = "$WATCH_NAME" ]; then
-          printf "%s" "$endpoint"; return 0
+          remember_endpoint "$endpoint"; printf "%s" "$endpoint"; return 0
         fi
       fi
-    fi
-  done < <(adb mdns services 2>/dev/null)
+    done < <(adb mdns services 2>/dev/null | grep '_adb-tls-connect\._tcp')
+    [ "$try" -lt 3 ] && sleep 1
+  done
   return 1
+}
+
+# Quote a path for the watch's remote shell — single-quoted, embedded ' escaped.
+# Filenames with $, backticks or quotes must never reach the remote shell raw.
+rq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# Refresh the cached list of songs on the watch (one rel path per line).
+# Writes atomically: a listing that dies halfway (watch dozed off) must not
+# clobber the last good list — sync and pending counts depend on it.
+fetch_watch_list() { # endpoint
+  mkdir -p "$CACHE_DIR"
+  local tmp="$CACHE_DIR/on_watch.list.tmp"
+  if adb -s "$1" shell "find '$WATCH_DIR' -type f -name '*.mp3'" </dev/null 2>/dev/null \
+      | tr -d '\r' | sed "s#^$WATCH_DIR/##" | sort >"$tmp"; then
+    mv "$tmp" "$CACHE_DIR/on_watch.list"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
 }
 
 # --- conversion -------------------------------------------------------------
@@ -137,17 +200,21 @@ mp3_for() {
 # --- main commands ----------------------------------------------------------
 cmd_pair() {
   require adb android-platform-tools || exit 1
-  say "${B}flac2watch — Uhr koppeln${X}"
-  say ""
-  say "Auf der ${B}Galaxy Watch${X}:"
-  say "  1. Einstellungen → Uhr-Info → Softwareinformationen → 7× auf 'Softwareversion' tippen"
-  say "  2. Einstellungen → Entwickleroptionen → ${B}ADB-Debugging${X} + ${B}Drahtloses Debugging${X} an"
-  say "  3. Uhr ins ${B}selbe WLAN${X} wie dieser Mac"
-  say "  4. Drahtloses Debugging → ${B}'Gerät koppeln'${X} antippen (zeigt IP:Port + 6-stelligen Code)"
-  say ""
-  printf "IP:Port (z.B. 192.168.1.77:46151): "; read -r addr
-  printf "Kopplungscode (6-stellig):          "; read -r code
-  say ""
+  # Non-interactive: flac2watch pair <ip:port> <code>   (used by the app)
+  local addr="${1:-}" code="${2:-}"
+  if [ -z "$addr" ] || [ -z "$code" ]; then
+    say "${B}flac2watch — Uhr koppeln${X}"
+    say ""
+    say "Auf der ${B}Galaxy Watch${X}:"
+    say "  1. Einstellungen → Uhr-Info → Softwareinformationen → 7× auf 'Softwareversion' tippen"
+    say "  2. Einstellungen → Entwickleroptionen → ${B}ADB-Debugging${X} + ${B}Drahtloses Debugging${X} an"
+    say "  3. Uhr ins ${B}selbe WLAN${X} wie dieser Mac"
+    say "  4. Drahtloses Debugging → ${B}'Gerät koppeln'${X} antippen (zeigt IP:Port + 6-stelligen Code)"
+    say ""
+    printf "IP:Port (z.B. 192.168.1.77:46151): "; read -r addr
+    printf "Kopplungscode (6-stellig):          "; read -r code
+    say ""
+  fi
   if ! adb pair "$addr" "$code"; then
     err "Kopplung fehlgeschlagen. Code/Port ändern sich — Bildschirm offen lassen und neu versuchen."
     exit 1
@@ -164,9 +231,31 @@ cmd_pair() {
   ok "Fertig. Lege Musik in ${B}$LIBRARY${X} und führe ${C}flac2watch sync${X} aus (oder nutze die App / den Auto-Sync)."
 }
 
+# The launchd agent and the app can both trigger a sync; a lock keeps them
+# from pushing the same files concurrently.
+SYNC_LOCK="$CACHE_DIR/sync.lock"
+acquire_sync_lock() {
+  mkdir -p "$CACHE_DIR"
+  local try pid
+  for try in 1 2; do
+    if mkdir "$SYNC_LOCK" 2>/dev/null; then
+      printf '%s' "$$" >"$SYNC_LOCK/pid"
+      trap 'rm -rf "$SYNC_LOCK"' EXIT
+      return 0
+    fi
+    pid=$(cat "$SYNC_LOCK/pid" 2>/dev/null || true)
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      return 1                      # another sync is really running
+    fi
+    rm -rf "$SYNC_LOCK"             # stale lock from a crashed sync
+  done
+  return 1
+}
+
 cmd_sync() {
   require ffmpeg ffmpeg || exit 1
   require adb android-platform-tools || exit 1
+  acquire_sync_lock || { warn "Ein anderer Sync läuft gerade — übersprungen."; log "sync skipped (already running)"; exit 0; }
   [ -d "$LIBRARY" ] || mkdir -p "$LIBRARY"
 
   local endpoint
@@ -174,60 +263,81 @@ cmd_sync() {
     # Watch offline is the normal idle state — stay completely silent so the
     # background agent never spams notifications. (Only printed when run by hand.)
     log "watch not reachable"
-    warn "Uhr nicht erreichbar (WLAN aus, nicht im Netz, oder Drahtloses Debugging aus)."
+    warn "Uhr nicht erreichbar — Display der Uhr kurz wecken und nochmal versuchen (ihr WLAN schläft bei Display aus). Sonst: selbes WLAN? Drahtloses Debugging an?"
     exit 0
   }
   local W="-s $endpoint"
   ok "Uhr verbunden ($endpoint)"
 
   # What's already on the watch?
-  adb $W shell "mkdir -p '$WATCH_DIR'" >/dev/null 2>&1
+  adb $W shell "mkdir -p '$WATCH_DIR'" </dev/null >/dev/null 2>&1
   local on_watch; on_watch="$CACHE_DIR/on_watch.list"
-  mkdir -p "$CACHE_DIR"
-  adb $W shell "find '$WATCH_DIR' -type f -name '*.mp3'" 2>/dev/null \
-    | sed "s#^$WATCH_DIR/##" | sort >"$on_watch"
+  fetch_watch_list "$endpoint"
 
-  # Build target list from the library.
+  # Pass 1: build the target list and collect what's missing — before any push,
+  # so the total is known for progress reporting.
   local want; want="$CACHE_DIR/want.list"; : >"$want"
-  local pushed=0 converted=0 failed=0 scan="$CACHE_DIR/scan.list"; : >"$scan"
-  local src rel target playable remote
+  local missing; missing="$CACHE_DIR/missing.list"; : >"$missing"
+  local src rel target
   while IFS= read -r -d '' src; do
     rel="${src#"$LIBRARY"/}"
     target="${rel%.*}.mp3"   # everything is normalized to .mp3
     printf "%s\n" "$target" >>"$want"
-    if ! grep -Fxq "$target" "$on_watch"; then
-      case "$src" in *.flac|*.FLAC|*.m4a|*.M4A) converted=$((converted+1));; esac
-      playable=$(mp3_for "$src" "$rel") || { failed=$((failed+1)); continue; }
-      remote="$WATCH_DIR/$target"
-      adb $W shell "mkdir -p \"$(dirname "$remote")\"" >/dev/null 2>&1
-      if adb $W push "$playable" "$remote" >/dev/null 2>&1; then
-        pushed=$((pushed+1))
-        printf "%s\n" "$remote" >>"$scan"
-        say "  ${G}+${X} $target"
-      else
-        failed=$((failed+1)); err "Push fehlgeschlagen: $target"
-      fi
-    fi
+    grep -Fxq "$target" "$on_watch" || printf '%s\t%s\n' "$src" "$rel" >>"$missing"
   done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0)
 
-  # Mirror deletions (only inside our own watch folder).
+  # Pass 2: convert + push.
+  local total idx=0 pushed=0 failed=0 scan="$CACHE_DIR/scan.list"; : >"$scan"
+  total=$(wc -l <"$missing" | tr -d ' ')
+  if $PROGRESS; then printf 'TOTAL %s\n' "$total"; fi
+  local playable remote
+  while IFS=$'\t' read -r src rel; do
+    [ -z "$src" ] && continue
+    idx=$((idx+1))
+    target="${rel%.*}.mp3"
+    if $PROGRESS; then printf 'PROGRESS %s %s %s\n' "$idx" "$total" "$target"; fi
+    playable=$(mp3_for "$src" "$rel") || { failed=$((failed+1)); continue; }
+    remote="$WATCH_DIR/$target"
+    adb $W shell "mkdir -p $(rq "$(dirname "$remote")")" </dev/null >/dev/null 2>&1
+    if adb $W push "$playable" "$remote" </dev/null >/dev/null 2>&1; then
+      pushed=$((pushed+1))
+      printf "%s\n" "$remote" >>"$scan"
+      say "  ${G}+${X} $target"
+    else
+      failed=$((failed+1)); err "Push fehlgeschlagen: $target"
+    fi
+  done <"$missing"
+
+  # Mirror deletions (only inside our own watch folder). Safety net: if the
+  # local library is completely empty, assume something went wrong (folder
+  # moved or emptied by accident) and do NOT clear the watch.
   local removed=0
   if [ "$MIRROR_DELETE" = "true" ] && [ -s "$on_watch" ]; then
-    sort -o "$want" "$want"
-    while IFS= read -r target; do
-      [ -z "$target" ] && continue
-      if ! grep -Fxq "$target" "$want"; then
-        adb $W shell "rm -f \"$WATCH_DIR/$target\"" >/dev/null 2>&1 && removed=$((removed+1))
-      fi
-    done <"$on_watch"
+    if [ ! -s "$want" ]; then
+      warn "Bibliothek ist leer — lösche zur Sicherheit nichts auf der Uhr."
+      log "mirror delete skipped: empty library"
+    else
+      sort -o "$want" "$want"
+      while IFS= read -r target; do
+        [ -z "$target" ] && continue
+        if ! grep -Fxq "$target" "$want"; then
+          adb $W shell "rm -f $(rq "$WATCH_DIR/$target")" </dev/null >/dev/null 2>&1 && removed=$((removed+1))
+        fi
+      done <"$on_watch"
+    fi
   fi
+  # Sweep album folders that became empty after deletions.
+  [ "$removed" -gt 0 ] && adb $W shell "find '$WATCH_DIR' -mindepth 1 -type d -empty -delete" </dev/null >/dev/null 2>&1
 
   # Trigger media scan for newly pushed files.
   if [ -s "$scan" ]; then
     while IFS= read -r remote; do
-      adb $W shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d \"file://$remote\"" >/dev/null 2>&1
+      adb $W shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d $(rq "file://$remote")" </dev/null >/dev/null 2>&1
     done <"$scan"
   fi
+
+  # Keep the cached watch list current (pending counts, app song list).
+  fetch_watch_list "$endpoint"
 
   # Player check.
   local have_player="yes"
@@ -236,7 +346,10 @@ cmd_sync() {
   say ""
   if [ "$pushed" -gt 0 ] || [ "$removed" -gt 0 ]; then
     ok "Sync fertig: ${B}$pushed${X} neu, $removed entfernt$( [ "$failed" -gt 0 ] && printf ", %s Fehler" "$failed")."
-    notify "FLAC2Watch" "$pushed Songs auf die Uhr gesynct."
+    local nmsg=""
+    [ "$pushed" -gt 0 ] && nmsg="$pushed neu auf der Uhr"
+    [ "$removed" -gt 0 ] && nmsg="${nmsg:+$nmsg, }$removed entfernt"
+    notify "FLAC2Watch" "Sync fertig: $nmsg."
     log "synced: +$pushed -$removed fail=$failed"
   else
     ok "Schon aktuell — nichts zu tun."
@@ -262,6 +375,46 @@ cmd_player() {
 }
 
 cmd_status() {
+  # Machine-readable key=value output (used by the FLAC2Watch app).
+  if [ "${1:-}" = "--porcelain" ]; then
+    local n
+    n=$(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null | wc -l | tr -d ' ')
+    printf 'library=%s\n' "$LIBRARY"
+    printf 'local=%s\n' "$n"
+    printf 'paired=%s\n' "$WATCH_NAME"
+    printf 'bitrate=%s\n' "$BITRATE"
+    printf 'mirror_delete=%s\n' "$MIRROR_DELETE"
+    local ow="$CACHE_DIR/on_watch.list" endpoint
+    if endpoint=$(discover_watch); then
+      local w p="0" batt free total
+      fetch_watch_list "$endpoint" || true
+      w=$(wc -l <"$ow" 2>/dev/null | tr -d ' ')
+      w="${w:-0}"
+      adb -s "$endpoint" shell pm path "$PLAYER_PKG" </dev/null >/dev/null 2>&1 && p="1"
+      batt=$(adb -s "$endpoint" shell dumpsys battery </dev/null 2>/dev/null | awk '/level:/{print $2; exit}' | tr -d '\r')
+      # df: Filesystem 1K-blocks Used Available Use% Mounted
+      set -- $(adb -s "$endpoint" shell df -k /sdcard </dev/null 2>/dev/null | tail -1)
+      total="${2:-}"; free="${4:-}"
+      printf 'reachable=1\nendpoint=%s\nwatch=%s\nplayer=%s\n' "$endpoint" "$w" "$p"
+      case "$batt" in ''|*[!0-9]*) ;; *) printf 'battery=%s\n' "$batt" ;; esac
+      case "$free" in ''|*[!0-9]*) ;; *) printf 'free_kb=%s\ntotal_kb=%s\n' "$free" "${total:-0}" ;; esac
+    else
+      printf 'reachable=0\n'
+    fi
+    # pending = local songs not yet on the watch (last known list when offline)
+    local pending=0 src target
+    if [ -f "$ow" ]; then
+      while IFS= read -r -d '' src; do
+        target="${src#"$LIBRARY"/}"; target="${target%.*}.mp3"
+        grep -Fxq "$target" "$ow" || pending=$((pending+1))
+      done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+    else
+      pending="$n"
+    fi
+    printf 'pending=%s\n' "$pending"
+    return 0
+  fi
+
   say "${B}flac2watch — Status${X}"
   say "  Bibliothek : $LIBRARY"
   local n; n=$(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null | wc -l | tr -d ' ')
@@ -287,6 +440,79 @@ cmd_doctor() {
   if discover_watch >/dev/null; then ok "Uhr erreichbar"; else warn "Uhr nicht erreichbar"; fi
 }
 
+cmd_list() {
+  # Songs on the watch, one rel path per line. Falls back to the cached list
+  # (first line "# cached") when the watch is asleep.
+  require adb android-platform-tools || exit 1
+  local ow="$CACHE_DIR/on_watch.list" endpoint
+  if endpoint=$(discover_watch); then
+    fetch_watch_list "$endpoint"
+    cat "$ow"
+  elif [ -f "$ow" ]; then
+    printf '# cached\n'
+    cat "$ow"
+  else
+    exit 1
+  fi
+}
+
+cmd_remove() { # <rel target.mp3> — delete one song from the watch
+  require adb android-platform-tools || exit 1
+  local target="${1:-}"
+  [ -z "$target" ] && { err "Nutzung: flac2watch remove <Pfad-auf-der-Uhr.mp3>"; exit 1; }
+  local endpoint
+  endpoint=$(discover_watch) || { err "Uhr nicht erreichbar."; exit 1; }
+  adb -s "$endpoint" shell "rm -f $(rq "$WATCH_DIR/$target")" </dev/null >/dev/null 2>&1
+  adb -s "$endpoint" shell "find '$WATCH_DIR' -mindepth 1 -type d -empty -delete" </dev/null >/dev/null 2>&1
+  fetch_watch_list "$endpoint"
+  ok "Von der Uhr entfernt: $target"
+}
+
+cmd_ping() {
+  # Cheap reachability check / keep-awake tick for the app.
+  require adb android-platform-tools || exit 1
+  local endpoint
+  endpoint=$(discover_watch) || exit 1
+  adb -s "$endpoint" shell true </dev/null >/dev/null 2>&1
+}
+
+cmd_launch() {
+  # Start the music player app on the watch.
+  require adb android-platform-tools || exit 1
+  local endpoint
+  endpoint=$(discover_watch) || { err "Uhr nicht erreichbar."; exit 1; }
+  adb -s "$endpoint" shell monkey -p "$PLAYER_PKG" -c android.intent.category.LAUNCHER 1 </dev/null >/dev/null 2>&1 \
+    && ok "Player auf der Uhr gestartet." \
+    || err "Konnte den Player nicht starten (ist er installiert? → flac2watch player)."
+}
+
+cmd_config() {
+  case "${1:-}" in
+    set)
+      local key="${2:-}" val="${3:-}"
+      case "$key" in
+        bitrate)
+          case "$val" in
+            128k|160k|192k|256k|320k) BITRATE="$val"; rm -rf "$MP3_CACHE" ;;  # neue Bitrate → Cache neu aufbauen
+            *) err "Ungültige Bitrate: '$val' (128k|160k|192k|256k|320k)"; exit 1 ;;
+          esac ;;
+        mirror_delete)
+          case "$val" in
+            true|false) MIRROR_DELETE="$val" ;;
+            *) err "mirror_delete: true|false"; exit 1 ;;
+          esac ;;
+        library)
+          [ -d "$val" ] || { err "Ordner existiert nicht: $val"; exit 1; }
+          LIBRARY="$val" ;;
+        *) err "Unbekannter Schlüssel: '$key' (bitrate|mirror_delete|library)"; exit 1 ;;
+      esac
+      save_config
+      ok "$key = $val" ;;
+    *)
+      err "Nutzung: flac2watch config set <bitrate|mirror_delete|library> <Wert>"; exit 1 ;;
+  esac
+}
+
 usage() {
   cat <<EOF
 ${B}flac2watch${X} — Musik per WLAN auf die Galaxy Watch syncen
@@ -294,7 +520,10 @@ ${B}flac2watch${X} — Musik per WLAN auf die Galaxy Watch syncen
   ${C}flac2watch pair${X}             Uhr einmalig koppeln
   ${C}flac2watch sync${X} [--notify]  Konvertieren + alles Fehlende auf die Uhr pushen
   ${C}flac2watch status${X}           Status anzeigen
-  ${C}flac2watch player${X}           Musik-Player-Seite auf der Uhr öffnen
+  ${C}flac2watch list${X}             Songs auf der Uhr auflisten
+  ${C}flac2watch launch${X}           Musik-Player auf der Uhr starten
+  ${C}flac2watch player${X}           Player-Installationsseite auf der Uhr öffnen
+  ${C}flac2watch config set${X} …     bitrate | mirror_delete | library ändern
   ${C}flac2watch doctor${X}           Voraussetzungen prüfen
   ${C}flac2watch open${X}             Musik-Ordner im Finder öffnen
 
@@ -304,13 +533,21 @@ EOF
 
 # --- dispatch ---------------------------------------------------------------
 load_config
-for a in "$@"; do [ "$a" = "--notify" ] && NOTIFY=true; done
+for a in "$@"; do
+  [ "$a" = "--notify" ] && NOTIFY=true
+  [ "$a" = "--progress" ] && PROGRESS=true
+done
 
 case "${1:-}" in
-  pair)        cmd_pair ;;
+  pair)        cmd_pair "${2:-}" "${3:-}" ;;
   sync)        cmd_sync ;;
   player)      cmd_player ;;
-  status)      cmd_status ;;
+  list)        cmd_list ;;
+  remove)      cmd_remove "${2:-}" ;;
+  ping)        cmd_ping ;;
+  launch)      cmd_launch ;;
+  config)      cmd_config "${2:-}" "${3:-}" "${4:-}" ;;
+  status)      cmd_status "${2:-}" ;;
   doctor)      cmd_doctor ;;
   open)        open "$LIBRARY" 2>/dev/null || { mkdir -p "$LIBRARY"; open "$LIBRARY"; } ;;
   ""|-h|--help|help) usage ;;
