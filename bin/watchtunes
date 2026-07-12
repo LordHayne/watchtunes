@@ -275,10 +275,16 @@ cmd_scan() {
       rel="${src#"$lib"/}"
       target="$lname/$rel"
       target="${target%.*}.mp3"
-      tags=$(ffprobe -v quiet -show_entries format_tags=artist,ARTIST,album,ALBUM,title,TITLE -of csv=p=0 "$src" 2>/dev/null | tr -d '\r')
-      artist=$(echo "$tags" | head -1)
-      album=$(echo "$tags" | sed -n '2p')
-      title=$(echo "$tags" | sed -n '3p')
+      # Single ffprobe + python call for all tags (JSON avoids CSV comma issues)
+      # Use \t separator in python output to avoid space-splitting in read
+      local jmeta artist album title
+      jmeta=$(ffprobe -v quiet -print_format json -show_entries format_tags=artist,album,title "$src" 2>/dev/null)
+      IFS=$'\t' read -r artist album title <<< "$(echo "$jmeta" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+t=d.get('format',{}).get('tags',{})
+print('\t'.join([t.get('ARTIST') or t.get('artist') or '', t.get('ALBUM') or t.get('album') or '', t.get('TITLE') or t.get('title') or '']))
+" 2>/dev/null | tr -d '\r')"
       [ -z "$artist" ] && artist=""
       [ -z "$album" ] && album=""
       [ -z "$title" ] && title=""
