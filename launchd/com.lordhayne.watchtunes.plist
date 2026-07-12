@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Auto-sync LaunchAgent for flac2watch.
+  Auto-sync LaunchAgent for watchtunes.
   NOTE: __BIN__ and __LIBRARY__ are placeholders. install.sh writes a copy
   with the real paths to ~/Library/LaunchAgents/ and loads it.
 -->
@@ -8,7 +8,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.lordhayne.flac2watch</string>
+    <string>com.lordhayne.watchtunes</string>
 
     <key>ProgramArguments</key>
     <array>

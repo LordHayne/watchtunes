@@ -3,13 +3,13 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>FLAC2Watch</string>
+	<string>WatchTunes</string>
 	<key>CFBundleDisplayName</key>
-	<string>FLAC2Watch</string>
+	<string>WatchTunes</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.lordhayne.flac2watch.app</string>
+	<string>com.lordhayne.watchtunes.app</string>
 	<key>CFBundleExecutable</key>
-	<string>FLAC2Watch</string>
+	<string>WatchTunes</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -17,7 +17,7 @@
 	<key>CFBundleVersion</key>
 	<string>1</string>
 	<key>CFBundleIconFile</key>
-	<string>FLAC2Watch</string>
+	<string>WatchTunes</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>26.0</string>
 	<key>NSPrincipalClass</key>

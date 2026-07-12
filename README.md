@@ -1,10 +1,10 @@
-# flac2watch 🎵→⌚
+# watchtunes 🎵→⌚
 
 Drop your music in a folder — it lands on your **Galaxy Watch / Wear OS** watch
 automatically. No Bluetooth, no Galaxy Wearable, no one‑song‑at‑a‑time misery.
 
 The official way to put your own music on a Galaxy Watch (Bluetooth sync via the
-Galaxy Wearable app) is slow and constantly aborts. `flac2watch` does it over
+Galaxy Wearable app) is slow and constantly aborts. `watchtunes` does it over
 **Wi‑Fi with `adb`** instead: it converts FLAC to MP3, finds the watch on your
 network, pushes everything that's missing, and triggers the media scan — all in
 the background.
@@ -34,12 +34,12 @@ the background.
 ## Install
 
 ```sh
-git clone https://github.com/LordHayne/flac2watch.git
-cd flac2watch
+git clone https://github.com/LordHayne/watchtunes.git
+cd watchtunes
 ./install.sh
 ```
 
-This installs the `flac2watch` CLI, builds the **FLAC2Watch** app into
+This installs the `watchtunes` CLI, builds the **WatchTunes** app into
 `~/Applications`, and loads the auto‑sync agent.
 
 ## First‑time setup (pair the watch)
@@ -54,43 +54,43 @@ On the **watch**:
 Then on the Mac:
 
 ```sh
-flac2watch pair        # enter the IP:Port and code shown on the watch
+watchtunes pair        # enter the IP:Port and code shown on the watch
 ```
 
-…or open the **FLAC2Watch** app and click **Uhr koppeln** — same thing, with
+…or open the **WatchTunes** app and click **Uhr koppeln** — same thing, with
 text fields instead of a terminal.
 
 Pairing is **one‑time** — the Mac remembers the watch and reconnects on its own.
 
 ## Use
 
-Just put music into **`~/Music/WatchSync`** (drop it into the **FLAC2Watch** app
+Just put music into **`~/Music/WatchSync`** (drop it into the **WatchTunes** app
 window, drag it onto its Dock icon, or copy in Finder). The auto‑sync agent
 pushes it whenever the watch is reachable.
 
-The **FLAC2Watch** app shows whether the watch is reachable, how many songs are
+The **WatchTunes** app shows whether the watch is reachable, how many songs are
 local vs. on the watch, and has a **Jetzt syncen** button when you don't want
 to wait for the auto‑sync.
 
 Manual control:
 
 ```sh
-flac2watch sync        # convert + push everything missing, now
-flac2watch status      # library + watch song counts, reachability
-flac2watch list        # songs currently on the watch
-flac2watch launch      # start the music player on the watch
-flac2watch player      # open the player's install page on the watch
-flac2watch config set  # bitrate | mirror_delete | library
-flac2watch doctor      # check requirements & connection
-flac2watch open        # reveal the music folder in Finder
+watchtunes sync        # convert + push everything missing, now
+watchtunes status      # library + watch song counts, reachability
+watchtunes list        # songs currently on the watch
+watchtunes launch      # start the music player on the watch
+watchtunes player      # open the player's install page on the watch
+watchtunes config set  # bitrate | mirror_delete | library
+watchtunes doctor      # check requirements & connection
+watchtunes open        # reveal the music folder in Finder
 ```
 
 ## A watch needs a player app
 
 Galaxy Watch ships **without** a local music player. Install
 **“Music for Galaxy Watch”** (`com.samsung.android.wearable.music`) from the
-Play Store on the watch — `flac2watch player` opens it for you. It then plays
-everything `flac2watch` pushed. Pair Bluetooth earbuds and the phone can stay home.
+Play Store on the watch — `watchtunes player` opens it for you. It then plays
+everything `watchtunes` pushed. Pair Bluetooth earbuds and the phone can stay home.
 
 ## Honest limitations (Wear OS, not us)
 
@@ -103,10 +103,10 @@ everything `flac2watch` pushed. Pair Bluetooth earbuds and the phone can stay ho
 ## Uninstall
 
 ```sh
-launchctl unload ~/Library/LaunchAgents/com.lordhayne.flac2watch.plist
-rm ~/Library/LaunchAgents/com.lordhayne.flac2watch.plist
-rm ~/.local/bin/flac2watch /opt/homebrew/bin/flac2watch 2>/dev/null
-rm -rf ~/Applications/FLAC2Watch.app ~/.config/flac2watch ~/.cache/flac2watch
+launchctl unload ~/Library/LaunchAgents/com.lordhayne.watchtunes.plist
+rm ~/Library/LaunchAgents/com.lordhayne.watchtunes.plist
+rm ~/.local/bin/watchtunes /opt/homebrew/bin/watchtunes 2>/dev/null
+rm -rf ~/Applications/WatchTunes.app ~/.config/watchtunes ~/.cache/watchtunes
 ```
 
 ## License

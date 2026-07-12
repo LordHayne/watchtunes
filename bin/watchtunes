@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 #
-# flac2watch — convert a music folder to MP3 and auto-sync it to a
+# watchtunes — convert music folders to MP3 and auto-sync them to a
 # Wear OS / Galaxy Watch over Wi-Fi (adb). No Bluetooth, no Galaxy Wearable.
 #
 # Commands:
-#   flac2watch pair              one-time: pair the Mac with the watch
-#   flac2watch sync [--notify]   convert new files + push everything missing to the watch
-#   flac2watch status            show config, watch reachability, song counts
-#   flac2watch doctor            check requirements and connection
-#   flac2watch open              reveal the music library folder in Finder
+#   watchtunes pair              one-time: pair the Mac with the watch
+#   watchtunes sync [--notify]   convert new files + push everything missing to the watch
+#   watchtunes status             show config, watch reachability, song counts
+#   watchtunes doctor            check requirements and connection
+#   watchtunes open              reveal the music library folder in Finder
+#   watchtunes addfolder <path>  add a music library folder
+#   watchtunes rmfolder <path>   remove a music library folder
+#   watchtunes folders           list all configured library folders
+#   watchtunes scan              scan all libraries, output JSON per song
 #
-# Config lives in ~/.config/flac2watch/config (shell key=value).
+# Config lives in ~/.config/watchtunes/config (shell key=value / LIBRARIES array).
 #
 set -uo pipefail
 
@@ -19,20 +23,21 @@ set -uo pipefail
 export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 
 # --- paths / defaults -------------------------------------------------------
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/flac2watch"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/watchtunes"
 CONFIG_FILE="$CONFIG_DIR/config"
-CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/flac2watch"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/watchtunes"
 MP3_CACHE="$CACHE_DIR/mp3"
-LOG_FILE="$CACHE_DIR/flac2watch.log"
+LOG_FILE="$CACHE_DIR/watchtunes.log"
 
 LIBRARY_DEFAULT="$HOME/Music/WatchSync"
-WATCH_DIR="/sdcard/Music/FLAC2Watch"   # destination folder on the watch
+WATCH_DIR="/sdcard/Music/WatchTunes"   # destination folder on the watch
 BITRATE="320k"
 MIRROR_DELETE="true"                   # remove from watch what was removed locally
 PLAYER_PKG="com.samsung.android.wearable.music"
 
-# Loaded from config:
-LIBRARY="$LIBRARY_DEFAULT"
+# Multi-library support: LIBRARIES is a bash array of absolute paths.
+# Backward compat: if old config has LIBRARY=foo, it becomes a single-element array.
+LIBRARIES=()
 WATCH_NAME=""     # the paired adb mdns service name, e.g. adb-RFGL...-xxxx
 LAST_ENDPOINT=""  # adb serial (ip:port) that worked last time
 
@@ -58,14 +63,31 @@ notify() { # title, message — macOS notification when --notify is set
 # --- config -----------------------------------------------------------------
 load_config() {
   if [ -f "$CONFIG_FILE" ]; then
+    # Source the config file. It may contain LIBRARY= (old format) or
+    # LIBRARIES=( ... ) (new format). We handle both.
     # shellcheck disable=SC1090
     . "$CONFIG_FILE"
   fi
+  # Backward compatibility: if old-style LIBRARY is set but LIBRARIES is empty,
+  # promote LIBRARY to a single-element LIBRARIES array.
+  if [ "${#LIBRARIES[@]}" -eq 0 ] && [ -n "${LIBRARY:-}" ]; then
+    LIBRARIES=("$LIBRARY")
+  fi
+  # If still empty, use the default.
+  if [ "${#LIBRARIES[@]}" -eq 0 ]; then
+    LIBRARIES=("$LIBRARY_DEFAULT")
+  fi
 }
+
 save_config() {
   mkdir -p "$CONFIG_DIR"
   {
-    printf 'LIBRARY=%q\n' "$LIBRARY"
+    # Save LIBRARIES as a bash array
+    printf 'LIBRARIES=(\n'
+    for lib in "${LIBRARIES[@]}"; do
+      printf "  '%s'\n" "$lib"
+    done
+    printf ')\n'
     printf 'WATCH_NAME=%q\n' "$WATCH_NAME"
     printf 'LAST_ENDPOINT=%q\n' "$LAST_ENDPOINT"
     printf 'BITRATE=%q\n' "$BITRATE"
@@ -75,6 +97,34 @@ save_config() {
 
 require() {
   command -v "$1" >/dev/null 2>&1 || { err "'$1' fehlt. Bitte installieren (z.B. brew install $2)."; return 1; }
+}
+
+# --- library helpers --------------------------------------------------------
+
+# Get the basename of a library path (used as prefix in rel paths on watch)
+lib_name() {
+  basename "$1"
+}
+
+# Iterate over all valid (existing) libraries, calling the given function
+# with $1 = library_path, $2 = library_name
+for_each_library() {
+  local lib
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || continue
+    "$1" "$lib" "$(lib_name "$lib")"
+  done
+}
+
+# Count all audio files across all libraries
+count_all_songs() {
+  local lib total=0 n
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || continue
+    n=$(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null | wc -l | tr -d ' ')
+    total=$((total + n))
+  done
+  printf '%s' "$total"
 }
 
 # --- watch discovery / connection ------------------------------------------
@@ -147,8 +197,7 @@ discover_watch() {
 }
 
 # Quote a path for the watch's remote shell — single-quoted, embedded ' escaped.
-# Filenames with $, backticks or quotes must never reach the remote shell raw.
-rq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+rq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''\\\\''/g")"; }
 
 # Refresh the cached list of songs on the watch (one rel path per line).
 # Writes atomically: a listing that dies halfway (watch dozed off) must not
@@ -197,13 +246,105 @@ mp3_for() {
   printf "%s" "$out"
 }
 
+# --- multi-library scan -----------------------------------------------------
+# Scan all libraries, output one JSON line per song.
+# Format: {"library":"/path","rel":"library_name/Album/Song.mp3","abs":"/full/path/to/source.flac","artist":"...","album":"...","title":"...","cover":"/path/to/cover.jpg","has_cover":true}
+cmd_scan() {
+  mkdir -p "$CACHE_DIR/covers"
+  local lib lname src rel target artist album title cover_hash cover_path has_cover
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || continue
+    lname="$(lib_name "$lib")"
+    while IFS= read -r -d '' src; do
+      rel="${src#"$lib"/}"
+      target="$lname/$rel"
+      target="${target%.*}.mp3"   # normalize extension to .mp3
+      # Extract metadata via ffprobe
+      artist=$(ffprobe -v quiet -show_entries format_tags=artist,ARTIST -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+      album=$(ffprobe -v quiet -show_entries format_tags=album,ALBUM -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+      title=$(ffprobe -v quiet -show_entries format_tags=title,TITLE -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+      [ -z "$artist" ] && artist=""
+      [ -z "$album" ] && album=""
+      [ -z "$title" ] && title=""
+      # Extract cover if present
+      cover_hash=$(printf '%s' "$target" | md5 -q 2>/dev/null || printf '%s' "$target" | md5sum 2>/dev/null | awk '{print $1}')
+      cover_path="$CACHE_DIR/covers/${cover_hash}.jpg"
+      has_cover="false"
+      if [ ! -f "$cover_path" ]; then
+        ffmpeg -y -nostdin -loglevel quiet -i "$src" -an -vcodec mjpeg -vframes 1 "$cover_path" 2>/dev/null \
+          && [ -f "$cover_path" ] && has_cover="true" || rm -f "$cover_path"
+      else
+        has_cover="true"
+      fi
+      # Escape for JSON
+      esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+      printf '{"library":"%s","rel":"%s","abs":"%s","artist":"%s","album":"%s","title":"%s","cover":"%s","has_cover":%s}\n' \
+        "$(esc "$lib")" "$(esc "$target")" "$(esc "$src")" \
+        "$(esc "$artist")" "$(esc "$album")" "$(esc "$title")" \
+        "$([ -f "$cover_path" ] && printf '%s' "$cover_path" || printf '')" "$has_cover"
+    done < <(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+  done
+}
+
+# --- folder management commands ---------------------------------------------
+
+cmd_addfolder() {
+  local path="${1:-}"
+  [ -z "$path" ] && { err "Nutzung: watchtunes addfolder <Pfad>"; exit 1; }
+  # Resolve to absolute path
+  path="$(cd "$path" 2>/dev/null && pwd)" || { err "Ordner existiert nicht: $1"; exit 1; }
+  [ -d "$path" ] || { err "Ordner existiert nicht: $path"; exit 1; }
+  # Check for duplicates
+  for lib in "${LIBRARIES[@]}"; do
+    if [ "$lib" = "$path" ]; then
+      warn "Ordner bereits konfiguriert: $path"
+      exit 0
+    fi
+  done
+  LIBRARIES+=("$path")
+  save_config
+  ok "Bibliothek hinzugefügt: $path"
+  # Create the folder if it doesn't exist yet (so user can drop files in)
+  [ -d "$path" ] || mkdir -p "$path"
+}
+
+cmd_rmfolder() {
+  local path="${1:-}"
+  [ -z "$path" ] && { err "Nutzung: watchtunes rmfolder <Pfad>"; exit 1; }
+  # Try to resolve to absolute path if it exists
+  local resolved
+  resolved="$(cd "$path" 2>/dev/null && pwd)" || resolved="$path"
+  local found=false newlibs=()
+  for lib in "${LIBRARIES[@]}"; do
+    if [ "$lib" = "$resolved" ] || [ "$lib" = "$path" ]; then
+      found=true
+    else
+      newlibs+=("$lib")
+    fi
+  done
+  if ! $found; then
+    err "Bibliothek nicht gefunden: $path"
+    exit 1
+  fi
+  LIBRARIES=("${newlibs[@]}")
+  save_config
+  ok "Bibliothek entfernt: $path"
+}
+
+cmd_folders() {
+  local lib
+  for lib in "${LIBRARIES[@]}"; do
+    printf '%s\n' "$lib"
+  done
+}
+
 # --- main commands ----------------------------------------------------------
 cmd_pair() {
   require adb android-platform-tools || exit 1
-  # Non-interactive: flac2watch pair <ip:port> <code>   (used by the app)
+  # Non-interactive: watchtunes pair <ip:port> <code>   (used by the app)
   local addr="${1:-}" code="${2:-}"
   if [ -z "$addr" ] || [ -z "$code" ]; then
-    say "${B}flac2watch — Uhr koppeln${X}"
+    say "${B}watchtunes — Uhr koppeln${X}"
     say ""
     say "Auf der ${B}Galaxy Watch${X}:"
     say "  1. Einstellungen → Uhr-Info → Softwareinformationen → 7× auf 'Softwareversion' tippen"
@@ -225,10 +366,17 @@ cmd_pair() {
   local name
   name=$(adb mdns services 2>/dev/null | awk '/_adb-tls-connect\._tcp/{print $1; exit}')
   if [ -n "$name" ]; then WATCH_NAME="$name"; ok "Uhr gemerkt: $name"; fi
-  [ -d "$LIBRARY" ] || mkdir -p "$LIBRARY"
+  # Ensure at least the default library exists
+  if [ "${#LIBRARIES[@]}" -eq 0 ]; then
+    LIBRARIES=("$LIBRARY_DEFAULT")
+  fi
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || mkdir -p "$lib"
+  done
   save_config
+  local first="${LIBRARIES[0]}"
   say ""
-  ok "Fertig. Lege Musik in ${B}$LIBRARY${X} und führe ${C}flac2watch sync${X} aus (oder nutze die App / den Auto-Sync)."
+  ok "Fertig. Lege Musik in ${B}$first${X} und führe ${C}watchtunes sync${X} aus (oder nutze die App / den Auto-Sync)."
 }
 
 # The launchd agent and the app can both trigger a sync; a lock keeps them
@@ -256,7 +404,12 @@ cmd_sync() {
   require ffmpeg ffmpeg || exit 1
   require adb android-platform-tools || exit 1
   acquire_sync_lock || { warn "Ein anderer Sync läuft gerade — übersprungen."; log "sync skipped (already running)"; exit 0; }
-  [ -d "$LIBRARY" ] || mkdir -p "$LIBRARY"
+
+  # Ensure all library folders exist
+  local lib
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || mkdir -p "$lib"
+  done
 
   local endpoint
   endpoint=$(discover_watch) || {
@@ -276,27 +429,33 @@ cmd_sync() {
 
   # Pass 1: build the target list and collect what's missing — before any push,
   # so the total is known for progress reporting.
+  # rel paths are now library_name/Album/Song.mp3 to avoid collisions.
   local want; want="$CACHE_DIR/want.list"; : >"$want"
   local missing; missing="$CACHE_DIR/missing.list"; : >"$missing"
-  local src rel target
-  while IFS= read -r -d '' src; do
-    rel="${src#"$LIBRARY"/}"
-    target="${rel%.*}.mp3"   # everything is normalized to .mp3
-    printf "%s\n" "$target" >>"$want"
-    grep -Fxq "$target" "$on_watch" || printf '%s\t%s\n' "$src" "$rel" >>"$missing"
-  done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0)
+  local src rel target lname
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || continue
+    lname="$(lib_name "$lib")"
+    while IFS= read -r -d '' src; do
+      rel="${src#"$lib"/}"
+      target="$lname/$rel"
+      target="${target%.*}.mp3"   # everything is normalized to .mp3
+      printf "%s\n" "$target" >>"$want"
+      grep -Fxq "$target" "$on_watch" || printf '%s\t%s\t%s\n' "$src" "$target" "$lname" >>"$missing"
+    done < <(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+  done
 
   # Pass 2: convert + push.
   local total idx=0 pushed=0 failed=0 scan="$CACHE_DIR/scan.list"; : >"$scan"
   total=$(wc -l <"$missing" | tr -d ' ')
   if $PROGRESS; then printf 'TOTAL %s\n' "$total"; fi
   local playable remote
-  while IFS=$'\t' read -r src rel; do
+  while IFS=$'\t' read -r src target lname; do
     [ -z "$src" ] && continue
     idx=$((idx+1))
-    target="${rel%.*}.mp3"
     if $PROGRESS; then printf 'PROGRESS %s %s %s\n' "$idx" "$total" "$target"; fi
-    playable=$(mp3_for "$src" "$rel") || { failed=$((failed+1)); continue; }
+    # rel path within the mp3 cache = library_name/Album/Song.mp3 (same as target)
+    playable=$(mp3_for "$src" "$target") || { failed=$((failed+1)); continue; }
     remote="$WATCH_DIR/$target"
     adb $W shell "mkdir -p $(rq "$(dirname "$remote")")" </dev/null >/dev/null 2>&1
     if adb $W push "$playable" "$remote" </dev/null >/dev/null 2>&1; then
@@ -349,7 +508,7 @@ cmd_sync() {
     local nmsg=""
     [ "$pushed" -gt 0 ] && nmsg="$pushed neu auf der Uhr"
     [ "$removed" -gt 0 ] && nmsg="${nmsg:+$nmsg, }$removed entfernt"
-    notify "FLAC2Watch" "Sync fertig: $nmsg."
+    notify "WatchTunes" "Sync fertig: $nmsg."
     log "synced: +$pushed -$removed fail=$failed"
   else
     ok "Schon aktuell — nichts zu tun."
@@ -360,9 +519,9 @@ cmd_sync() {
     say ""
     warn "Auf der Uhr ist noch kein Musik-Player installiert."
     say "   Öffne Play Store auf der Uhr → 'Music for Galaxy Watch':"
-    say "   ${C}flac2watch player${X}   (öffnet die App-Seite auf der Uhr)"
+    say "   ${C}watchtunes player${X}   (öffnet die App-Seite auf der Uhr)"
     # Only nag about the missing player when we actually pushed something.
-    [ "$pushed" -gt 0 ] && notify "FLAC2Watch" "Musik-Player auf der Uhr fehlt – siehe Terminal."
+    [ "$pushed" -gt 0 ] && notify "WatchTunes" "Musik-Player auf der Uhr fehlt – siehe Terminal."
   fi
 }
 
@@ -375,11 +534,16 @@ cmd_player() {
 }
 
 cmd_status() {
-  # Machine-readable key=value output (used by the FLAC2Watch app).
+  # Machine-readable key=value output (used by the WatchTunes app).
   if [ "${1:-}" = "--porcelain" ]; then
     local n
-    n=$(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null | wc -l | tr -d ' ')
-    printf 'library=%s\n' "$LIBRARY"
+    n=$(count_all_songs)
+    printf 'libraries=%s\n' "${#LIBRARIES[@]}"
+    local i=0
+    for lib in "${LIBRARIES[@]}"; do
+      printf 'library_%d=%s\n' "$i" "$lib"
+      i=$((i+1))
+    done
     printf 'local=%s\n' "$n"
     printf 'paired=%s\n' "$WATCH_NAME"
     printf 'bitrate=%s\n' "$BITRATE"
@@ -402,12 +566,18 @@ cmd_status() {
       printf 'reachable=0\n'
     fi
     # pending = local songs not yet on the watch (last known list when offline)
-    local pending=0 src target
+    local pending=0 src target lname
     if [ -f "$ow" ]; then
-      while IFS= read -r -d '' src; do
-        target="${src#"$LIBRARY"/}"; target="${target%.*}.mp3"
-        grep -Fxq "$target" "$ow" || pending=$((pending+1))
-      done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+      for lib in "${LIBRARIES[@]}"; do
+        [ -d "$lib" ] || continue
+        lname="$(lib_name "$lib")"
+        while IFS= read -r -d '' src; do
+          rel="${src#"$lib"/}"
+          target="$lname/$rel"
+          target="${target%.*}.mp3"
+          grep -Fxq "$target" "$ow" || pending=$((pending+1))
+        done < <(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+      done
     else
       pending="$n"
     fi
@@ -415,10 +585,15 @@ cmd_status() {
     return 0
   fi
 
-  say "${B}flac2watch — Status${X}"
-  say "  Bibliothek : $LIBRARY"
-  local n; n=$(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null | wc -l | tr -d ' ')
-  say "  Songs lokal: $n"
+  say "${B}watchtunes — Status${X}"
+  say "  Bibliotheken (${#LIBRARIES[@]}):"
+  for lib in "${LIBRARIES[@]}"; do
+    local n
+    n=$(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) 2>/dev/null | wc -l | tr -d ' ')
+    say "    $lib ($n Songs)"
+  done
+  local total; total=$(count_all_songs)
+  say "  Songs lokal: $total"
   say "  Uhr gemerkt: ${WATCH_NAME:-<noch nicht gekoppelt>}"
   local endpoint
   if endpoint=$(discover_watch); then
@@ -431,12 +606,14 @@ cmd_status() {
 }
 
 cmd_doctor() {
-  say "${B}flac2watch — Doctor${X}"
+  say "${B}watchtunes — Doctor${X}"
   for t in ffmpeg adb; do
     if command -v "$t" >/dev/null 2>&1; then ok "$t: $(command -v "$t")"; else err "$t fehlt"; fi
   done
-  [ -d "$LIBRARY" ] && ok "Bibliothek: $LIBRARY" || warn "Bibliothek fehlt: $LIBRARY (lege ich beim Sync an)"
-  [ -n "$WATCH_NAME" ] && ok "Gekoppelt: $WATCH_NAME" || warn "Noch nicht gekoppelt → 'flac2watch pair'"
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] && ok "Bibliothek: $lib" || warn "Bibliothek fehlt: $lib (lege ich beim Sync an)"
+  done
+  [ -n "$WATCH_NAME" ] && ok "Gekoppelt: $WATCH_NAME" || warn "Noch nicht gekoppelt → 'watchtunes pair'"
   if discover_watch >/dev/null; then ok "Uhr erreichbar"; else warn "Uhr nicht erreichbar"; fi
 }
 
@@ -459,13 +636,23 @@ cmd_list() {
 cmd_remove() { # <rel target.mp3> — delete one song from the watch
   require adb android-platform-tools || exit 1
   local target="${1:-}"
-  [ -z "$target" ] && { err "Nutzung: flac2watch remove <Pfad-auf-der-Uhr.mp3>"; exit 1; }
+  [ -z "$target" ] && { err "Nutzung: watchtunes remove <Pfad-auf-der-Uhr.mp3>"; exit 1; }
   local endpoint
   endpoint=$(discover_watch) || { err "Uhr nicht erreichbar."; exit 1; }
   adb -s "$endpoint" shell "rm -f $(rq "$WATCH_DIR/$target")" </dev/null >/dev/null 2>&1
   adb -s "$endpoint" shell "find '$WATCH_DIR' -mindepth 1 -type d -empty -delete" </dev/null >/dev/null 2>&1
   fetch_watch_list "$endpoint"
   ok "Von der Uhr entfernt: $target"
+}
+
+cmd_disconnect() {
+  require adb android-platform-tools || exit 1
+  # Disconnect all watch connections and stop the keep-alive ping.
+  while IFS= read -r serial; do
+    adb disconnect "$serial" </dev/null >/dev/null 2>&1 || true
+  done < <(adb devices 2>/dev/null | awk 'NR>1 && $1 ~ /:/ {print $1}')
+  ok "Verbindung zur Uhr getrennt."
+  log "disconnected by user"
 }
 
 cmd_reconnect() {
@@ -500,43 +687,46 @@ cmd_ping() {
 }
 
 cmd_meta() {
-  # Machine-readable JSON: one line per local song with metadata + cover path.
-  # Cover is extracted to cache dir as <hash>.jpg (only if missing).
-  # Format: {"path":"...","artist":"...","album":"...","title":"...","cover":"/path/to/cover.jpg"}
+  # Legacy meta command — now just calls scan (which is a superset).
+  # Output format: {"path":"library_name/Album/Song.mp3","artist":"...","album":"...","title":"...","cover":"...","has_cover":true}
+  # Kept for backward compat with the old app, but scan is the preferred command.
   mkdir -p "$CACHE_DIR/covers"
-  local src rel target artist album title cover_hash cover_path has_cover
-  while IFS= read -r -d '' src; do
-    rel="${src#"$LIBRARY"/}"
-    target="${rel%.*}.mp3"
-    # Extract metadata via ffprobe
-    artist=$(ffprobe -v quiet -show_entries format_tags=artist,ARTIST -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
-    album=$(ffprobe -v quiet -show_entries format_tags=album,ALBUM -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
-    title=$(ffprobe -v quiet -show_entries format_tags=title,TITLE -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
-    [ -z "$artist" ] && artist=""
-    [ -z "$album" ] && album=""
-    [ -z "$title" ] && title=""
-    # Extract cover if present
-    cover_hash=$(printf '%s' "$rel" | md5 -q 2>/dev/null || printf '%s' "$rel" | md5sum 2>/dev/null | awk '{print $1}')
-    cover_path="$CACHE_DIR/covers/${cover_hash}.jpg"
-    has_cover="false"
-    if [ ! -f "$cover_path" ]; then
-      ffmpeg -y -nostdin -loglevel quiet -i "$src" -an -vcodec mjpeg -vframes 1 "$cover_path" 2>/dev/null \
-        && [ -f "$cover_path" ] && has_cover="true" || rm -f "$cover_path"
-    else
-      has_cover="true"
-    fi
-    # Escape for JSON
-    esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-    printf '{"path":"%s","artist":"%s","album":"%s","title":"%s","cover":"%s","has_cover":%s}\n' \
-      "$(esc "$target")" "$(esc "$artist")" "$(esc "$album")" "$(esc "$title")" \
-      "$([ -f "$cover_path" ] && printf '%s' "$cover_path" || printf '')" "$has_cover"
-  done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+  local lib lname src rel target artist album title cover_hash cover_path has_cover
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || continue
+    lname="$(lib_name "$lib")"
+    while IFS= read -r -d '' src; do
+      rel="${src#"$lib"/}"
+      target="$lname/$rel"
+      target="${target%.*}.mp3"
+      artist=$(ffprobe -v quiet -show_entries format_tags=artist,ARTIST -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+      album=$(ffprobe -v quiet -show_entries format_tags=album,ALBUM -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+      title=$(ffprobe -v quiet -show_entries format_tags=title,TITLE -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+      [ -z "$artist" ] && artist=""
+      [ -z "$album" ] && album=""
+      [ -z "$title" ] && title=""
+      cover_hash=$(printf '%s' "$target" | md5 -q 2>/dev/null || printf '%s' "$target" | md5sum 2>/dev/null | awk '{print $1}')
+      cover_path="$CACHE_DIR/covers/${cover_hash}.jpg"
+      has_cover="false"
+      if [ ! -f "$cover_path" ]; then
+        ffmpeg -y -nostdin -loglevel quiet -i "$src" -an -vcodec mjpeg -vframes 1 "$cover_path" 2>/dev/null \
+          && [ -f "$cover_path" ] && has_cover="true" || rm -f "$cover_path"
+      else
+        has_cover="true"
+      fi
+      esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+      printf '{"path":"%s","artist":"%s","album":"%s","title":"%s","cover":"%s","has_cover":%s}\n' \
+        "$(esc "$target")" "$(esc "$artist")" "$(esc "$album")" "$(esc "$title")" \
+        "$([ -f "$cover_path" ] && printf '%s' "$cover_path" || printf '')" "$has_cover"
+    done < <(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+  done
 }
 
 cmd_diff() {
   # Machine-readable: <status>\t<relative-path> for every local song.
   # status = synced (on watch) | pending (not yet on watch)
   # Uses cached on_watch.list when watch is offline.
+  # rel paths now include library_name/ prefix.
   local ow="$CACHE_DIR/on_watch.list"
   # Try to get a fresh watch list if reachable (non-fatal if offline)
   local endpoint
@@ -544,16 +734,21 @@ cmd_diff() {
     fetch_watch_list "$endpoint" || true
   fi
   if [ ! -f "$ow" ]; then : >"$ow"; fi
-  local src rel target
-  while IFS= read -r -d '' src; do
-    rel="${src#"$LIBRARY"/}"
-    target="${rel%.*}.mp3"
-    if grep -Fxq "$target" "$ow"; then
-      printf 'synced\t%s\n' "$target"
-    else
-      printf 'pending\t%s\n' "$target"
-    fi
-  done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+  local lib lname src rel target
+  for lib in "${LIBRARIES[@]}"; do
+    [ -d "$lib" ] || continue
+    lname="$(lib_name "$lib")"
+    while IFS= read -r -d '' src; do
+      rel="${src#"$lib"/}"
+      target="$lname/$rel"
+      target="${target%.*}.mp3"
+      if grep -Fxq "$target" "$ow"; then
+        printf 'synced\t%s\n' "$target"
+      else
+        printf 'pending\t%s\n' "$target"
+      fi
+    done < <(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+  done
 }
 
 cmd_launch() {
@@ -563,7 +758,7 @@ cmd_launch() {
   endpoint=$(discover_watch) || { err "Uhr nicht erreichbar."; exit 1; }
   adb -s "$endpoint" shell monkey -p "$PLAYER_PKG" -c android.intent.category.LAUNCHER 1 </dev/null >/dev/null 2>&1 \
     && ok "Player auf der Uhr gestartet." \
-    || err "Konnte den Player nicht starten (ist er installiert? → flac2watch player)."
+    || err "Konnte den Player nicht starten (ist er installiert? → watchtunes player)."
 }
 
 cmd_config() {
@@ -582,36 +777,63 @@ cmd_config() {
             *) err "mirror_delete: true|false"; exit 1 ;;
           esac ;;
         library)
+          # Legacy: set single library. We add it if not present.
           [ -d "$val" ] || { err "Ordner existiert nicht: $val"; exit 1; }
-          LIBRARY="$val" ;;
+          # If only one library and it's the default, replace it
+          if [ "${#LIBRARIES[@]}" -le 1 ]; then
+            LIBRARIES=("$val")
+          else
+            # Check if already present
+            local found=false
+            for lib in "${LIBRARIES[@]}"; do
+              [ "$lib" = "$val" ] && found=true && break
+            done
+            $found || LIBRARIES+=("$val")
+          fi
+          ;;
         *) err "Unbekannter Schlüssel: '$key' (bitrate|mirror_delete|library)"; exit 1 ;;
       esac
       save_config
       ok "$key = $val" ;;
     *)
-      err "Nutzung: flac2watch config set <bitrate|mirror_delete|library> <Wert>"; exit 1 ;;
+      err "Nutzung: watchtunes config set <bitrate|mirror_delete|library> <Wert>"; exit 1 ;;
   esac
+}
+
+cmd_open() {
+  # Open the first library in Finder
+  local first="${LIBRARIES[0]:-$LIBRARY_DEFAULT}"
+  [ -d "$first" ] || mkdir -p "$first"
+  open "$first" 2>/dev/null
 }
 
 usage() {
   cat <<EOF
-${B}flac2watch${X} — Musik per WLAN auf die Galaxy Watch syncen
+${B}watchtunes${X} — Musik per WLAN auf die Galaxy Watch syncen
 
-  ${C}flac2watch pair${X}             Uhr einmalig koppeln
-  ${C}flac2watch sync${X} [--notify]  Konvertieren + alles Fehlende auf die Uhr pushen
-  ${C}flac2watch status${X}           Status anzeigen
-  ${C}flac2watch list${X}             Songs auf der Uhr auflisten
-  ${C}flac2watch diff${X}             Sync-Status pro Song (synced/pending)
-  ${C}flac2watch meta${X}             Metadaten + Cover-Pfade als JSON (für die App)
-  ${C}flac2watch launch${X}           Musik-Player auf der Uhr starten
-  ${C}flac2watch player${X}           Player-Installationsseite auf der Uhr öffnen
-  ${C}flac2watch config set${X} …     bitrate | mirror_delete | library ändern
-  ${C}flac2watch reconnect${X}        Verbindung zur Uhr trennen und neu aufbauen
-  ${C}flac2watch doctor${X}           Voraussetzungen prüfen
-  ${C}flac2watch open${X}             Musik-Ordner im Finder öffnen
+  ${C}watchtunes pair${X}             Uhr einmalig koppeln
+  ${C}watchtunes sync${X} [--notify]  Konvertieren + alles Fehlende auf die Uhr pushen
+  ${C}watchtunes status${X}           Status anzeigen
+  ${C}watchtunes list${X}             Songs auf der Uhr auflisten
+  ${C}watchtunes diff${X}             Sync-Status pro Song (synced/pending)
+  ${C}watchtunes meta${X}             Metadaten + Cover-Pfade als JSON (für die App)
+  ${C}watchtunes scan${X}             Alle Bibliotheken scannen — JSON pro Song
+  ${C}watchtunes folders${X}          Alle konfigurierten Bibliotheken auflisten
+  ${C}watchtunes addfolder${X} <Pfad>  Bibliothek hinzufügen
+  ${C}watchtunes rmfolder${X} <Pfad>  Bibliothek entfernen
+  ${C}watchtunes launch${X}           Musik-Player auf der Uhr starten
+  ${C}watchtunes player${X}           Player-Installationsseite auf der Uhr öffnen
+  ${C}watchtunes config set${X} …     bitrate | mirror_delete | library ändern
+  ${C}watchtunes reconnect${X}        Verbindung zur Uhr trennen und neu aufbauen
+  ${C}watchtunes disconnect${X}       Verbindung zur Uhr trennen
+  ${C}watchtunes doctor${X}           Voraussetzungen prüfen
+  ${C}watchtunes open${X}             Musik-Ordner im Finder öffnen
 
-  Musik-Ordner: ${LIBRARY}
+  Bibliotheken:
 EOF
+  for lib in "${LIBRARIES[@]}"; do
+    printf '    %s\n' "$lib"
+  done
 }
 
 # --- dispatch ---------------------------------------------------------------
@@ -630,12 +852,17 @@ case "${1:-}" in
   ping)        cmd_ping ;;
   diff)        cmd_diff ;;
   meta)        cmd_meta ;;
+  scan)        cmd_scan ;;
+  folders)     cmd_folders ;;
+  addfolder)   cmd_addfolder "${2:-}" ;;
+  rmfolder)    cmd_rmfolder "${2:-}" ;;
   reconnect)   cmd_reconnect ;;
+  disconnect)  cmd_disconnect ;;
   launch)      cmd_launch ;;
   config)      cmd_config "${2:-}" "${3:-}" "${4:-}" ;;
   status)      cmd_status "${2:-}" ;;
   doctor)      cmd_doctor ;;
-  open)        open "$LIBRARY" 2>/dev/null || { mkdir -p "$LIBRARY"; open "$LIBRARY"; } ;;
+  open)        cmd_open ;;
   ""|-h|--help|help) usage ;;
   *) err "Unbekannter Befehl: $1"; usage; exit 1 ;;
 esac
