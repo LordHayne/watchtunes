@@ -88,11 +88,9 @@ final class AppState: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: 12, repeats: true) { [weak self] _ in
             self?.refresh()
         }
-        // Keep-awake: a tiny adb no-op every 10s keeps the watch's Wi-Fi from
-        // napping. Always on when reachable — the watch's Wi-Fi sleeps when
-        // the screen turns off, which kills the adb connection.
-        pingTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            guard let self, self.status.reachable, !self.syncing else { return }
+        // Keep-awake: a tiny adb no-op keeps the watch's Wi-Fi from napping.
+        pingTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { [weak self] _ in
+            guard let self, self.keepAwake, self.status.reachable, !self.syncing else { return }
             self.workQueue.async { self.runCLI(["ping"]) }
         }
     }
@@ -512,128 +510,31 @@ struct ContentView: View {
     @State private var showLibrary = false
 
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(spacing: 14) {
             header
+            if state.statusLoaded && state.status.paired { pills }
             if state.statusLoaded && state.status.reachable && !state.status.playerInstalled {
                 playerWarning
             }
-            // Two-column music editor
-            HStack(spacing: 0) {
-                // Left: local library
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack {
-                        Text("Lokal")
-                            .font(.system(size: 13, weight: .bold, design: .rounded))
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text("\(state.status.localCount)")
-                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    Divider()
-                    songList(isLocal: true)
-                }
-                .frame(maxWidth: .infinity)
-                .background(RoundedRectangle(cornerRadius: 14).fill(.black.opacity(0.2)))
-                .onDrop(of: [.fileURL], isTargeted: $dropTargeted, perform: handleDrop)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14)
-                        .strokeBorder(dropTargeted ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Color.clear), lineWidth: 2)
-                        .animation(.easeOut(duration: 0.15), value: dropTargeted)
-                )
-
-                // Center: sync controls
-                VStack(spacing: 10) {
-                    if state.statusLoaded && !state.status.paired && !state.cliMissing {
-                        Button { showPair = true } label: {
-                            Image(systemName: "link")
-                                .font(.system(size: 18))
-                        }
-                        .buttonStyle(.glassProminent)
-                        .tint(Theme.violet)
-                        .help("Uhr koppeln")
-                    } else {
-                        Button { state.sync() } label: {
-                            Image(systemName: "arrow.triangle.2.circlepath")
-                                .font(.system(size: 18))
-                        }
-                        .buttonStyle(.glassProminent)
-                        .tint(Theme.violet)
-                        .disabled(state.syncing || state.cliMissing)
-                        .help("Syncen")
-                    }
-                    if state.syncing, let p = state.syncProgress, p.total > 0 {
-                        VStack(spacing: 2) {
-                            ProgressView(value: Double(min(p.done, p.total)), total: Double(p.total))
-                                .progressViewStyle(.linear)
-                                .tint(Theme.violet)
-                                .frame(width: 40)
-                            Text("\(p.done)/\(p.total)")
-                                .font(.system(size: 9, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    if state.status.pending > 0 {
-                        Text("\(state.status.pending)")
-                            .font(.system(size: 11, weight: .bold, design: .rounded))
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Capsule().fill(.orange))
-                    }
-                }
-                .padding(.horizontal, 6)
-
-                // Right: on watch
-                VStack(alignment: .leading, spacing: 0) {
-                    HStack {
-                        Text("Uhr")
-                            .font(.system(size: 13, weight: .bold, design: .rounded))
-                            .foregroundStyle(.secondary)
-                        if let b = state.status.battery {
-                            Text("\(b)%")
-                                .font(.system(size: 10, design: .monospaced))
-                                .foregroundStyle(batteryColor(b))
-                        }
-                        Spacer()
-                        if let w = state.status.watchCount {
-                            Text("\(w)")
-                                .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                                .foregroundStyle(.tertiary)
-                        } else {
-                            Text("—")
-                                .font(.system(size: 11))
-                                .foregroundStyle(.tertiary)
-                        }
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
-                    Divider()
-                    songList(isLocal: false)
-                }
-                .frame(maxWidth: .infinity)
-                .background(RoundedRectangle(cornerRadius: 14).fill(.black.opacity(0.2)))
+            dropZone
+            actions
+            if state.syncing, let p = state.syncProgress, p.total > 0 {
+                progressBar(p)
             }
-            .padding(.horizontal, 14)
-            .padding(.top, 10)
             if state.nowPlaying != nil {
                 miniPlayer
-                    .padding(.horizontal, 14)
-                    .padding(.top, 8)
             }
+            logView
         }
-        .padding(.top, 16)
-        .frame(minWidth: 600, minHeight: 400)
+        .padding(20)
+        .padding(.top, 16)            // room for the traffic lights
+        .frame(width: 380)
         .background(windowBackground.ignoresSafeArea())
         .preferredColorScheme(.dark)
         .sheet(isPresented: $showPair) { PairSheet().environmentObject(state) }
         .sheet(isPresented: $showSettings) { SettingsSheet().environmentObject(state) }
-        .onAppear {
-            state.loadDiff()
-            state.loadMeta()
-        }
+        .sheet(isPresented: $showSongs) { SongsSheet().environmentObject(state) }
+        .sheet(isPresented: $showLibrary) { LibrarySheet().environmentObject(state) }
     }
 
     private var windowBackground: some View {
@@ -936,164 +837,9 @@ struct ContentView: View {
             }
         }
     }
-
-    @ViewBuilder
-    private var miniPlayer: some View {
-        if let meta = state.nowPlaying {
-            HStack(spacing: 10) {
-                // Cover thumbnail
-                if meta.hasCover, let img = NSImage(contentsOfFile: meta.coverPath) {
-                    Image(nsImage: img)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 28, height: 28)
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
-                } else {
-                    RoundedRectangle(cornerRadius: 5)
-                        .fill(Theme.accent.opacity(0.3))
-                        .frame(width: 28, height: 28)
-                        .overlay(Image(systemName: "music.note").font(.system(size: 10)).foregroundStyle(.secondary))
-                }
-                // Title + artist
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(meta.title.isEmpty ? (meta.path as NSString).lastPathComponent : meta.title)
-                        .font(.system(size: 11, weight: .medium))
-                        .lineLimit(1)
-                    if !meta.artist.isEmpty {
-                        Text(meta.artist)
-                            .font(.system(size: 9))
-                            .foregroundStyle(.tertiary)
-                            .lineLimit(1)
-                    }
-                }
-                Spacer()
-                // Controls
-                Button { state.previewTogglePause() } label: {
-                    Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.primary)
-                }
-                .buttonStyle(.plain)
-                Button { state.previewStop() } label: {
-                    Image(systemName: "stop.fill")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-            .glassEffect(.regular, in: .rect(cornerRadius: 14))
-        }
-    }
-
-    // MARK: - Editor song list (used in the two-column main view)
-
-    private func songList(isLocal: Bool) -> some View {
-        let entries = isLocal
-            ? state.libraryDiff
-            : state.libraryDiff.filter { $0.synced }
-        return Group {
-            if entries.isEmpty {
-                VStack(spacing: 6) {
-                    Image(systemName: isLocal ? "music.note.list" : "applewatch")
-                        .font(.system(size: 20))
-                        .foregroundStyle(.tertiary)
-                    Text(isLocal ? "Bibliothek leer" : "Nicht verbunden")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                    if isLocal {
-                        Text("Musik hierher ziehen")
-                            .font(.caption2)
-                            .foregroundStyle(.tertiary)
-                    }
-                }
-                .frame(maxWidth: .infinity, minHeight: 200)
-            } else {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 2) {
-                        ForEach(entries) { entry in
-                            editorSongRow(entry, isLocal: isLocal)
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    private func editorSongRow(_ entry: LibraryEntry, isLocal: Bool) -> some View {
-        let meta = state.songMeta[entry.path]
-        let displayName = meta?.title.isEmpty == false ? meta!.title : (entry.path as NSString).deletingPathExtension
-        let folder = (entry.path as NSString).deletingLastPathComponent
-        return HStack(spacing: 8) {
-            // Cover
-            if let m = meta, m.hasCover, let img = NSImage(contentsOfFile: m.coverPath) {
-                Image(nsImage: img)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: 28, height: 28)
-                    .clipShape(RoundedRectangle(cornerRadius: 5))
-            } else {
-                RoundedRectangle(cornerRadius: 5)
-                    .fill(Theme.accent.opacity(0.25))
-                    .frame(width: 28, height: 28)
-                    .overlay(Image(systemName: "music.note").font(.system(size: 10)).foregroundStyle(.secondary))
-            }
-            VStack(alignment: .leading, spacing: 1) {
-                Text(displayName)
-                    .font(.system(size: 11))
-                    .lineLimit(1)
-                if let m = meta, !m.artist.isEmpty {
-                    Text(m.artist)
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                } else if !folder.isEmpty {
-                    Text(folder)
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                        .lineLimit(1)
-                }
-            }
-            Spacer()
-            // Play button (both columns)
-            if let m = meta {
-                Button { state.previewPlay(m) } label: {
-                    Image(systemName: state.nowPlaying?.path == m.path && state.isPlaying
-                          ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(state.nowPlaying?.path == m.path ? Theme.cyan : Color.gray.opacity(0.6))
-                }
-                .buttonStyle(.plain)
-                .help("Vorschau")
-            }
-            // Sync status (local only), delete (watch only)
-            if isLocal {
-                Image(systemName: entry.synced ? "checkmark.circle.fill" : "clock.fill")
-                    .font(.system(size: 10))
-                    .foregroundStyle(entry.synced ? .green : .orange)
-            } else {
-                Button { state.removeSong(entry.path) } label: {
-                    Image(systemName: "trash")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tertiary)
-                }
-                .buttonStyle(.plain)
-                .help("Von der Uhr entfernen")
-                .disabled(!state.status.reachable)
-            }
-        }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 4)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(state.nowPlaying?.path == entry.path
-                      ? Theme.cyan.opacity(0.12) : Color.clear)
-        )
-    }
 }
 
-// MARK: - Songs on the watch (legacy sheet, unused in new layout but kept for menu bar)
+// MARK: - Songs on the watch
 
 struct SongsSheet: View {
     @EnvironmentObject var state: AppState
@@ -1593,7 +1339,8 @@ struct FLAC2WatchApp: App {
                 .onAppear { state.start() }
         }
         .windowStyle(.hiddenTitleBar)
-        .windowResizability(.contentMinSize)
+        .windowResizability(.contentSize)
+        .windowBackgroundDragBehavior(.enabled)
 
         MenuBarExtra {
             MenuBarContent().environmentObject(state)

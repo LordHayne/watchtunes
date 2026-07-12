@@ -499,6 +499,40 @@ cmd_ping() {
   adb -s "$endpoint" shell true </dev/null >/dev/null 2>&1
 }
 
+cmd_meta() {
+  # Machine-readable JSON: one line per local song with metadata + cover path.
+  # Cover is extracted to cache dir as <hash>.jpg (only if missing).
+  # Format: {"path":"...","artist":"...","album":"...","title":"...","cover":"/path/to/cover.jpg"}
+  mkdir -p "$CACHE_DIR/covers"
+  local src rel target artist album title cover_hash cover_path has_cover
+  while IFS= read -r -d '' src; do
+    rel="${src#"$LIBRARY"/}"
+    target="${rel%.*}.mp3"
+    # Extract metadata via ffprobe
+    artist=$(ffprobe -v quiet -show_entries format_tags=artist,ARTIST -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+    album=$(ffprobe -v quiet -show_entries format_tags=album,ALBUM -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+    title=$(ffprobe -v quiet -show_entries format_tags=title,TITLE -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+    [ -z "$artist" ] && artist=""
+    [ -z "$album" ] && album=""
+    [ -z "$title" ] && title=""
+    # Extract cover if present
+    cover_hash=$(printf '%s' "$rel" | md5 -q 2>/dev/null || printf '%s' "$rel" | md5sum 2>/dev/null | awk '{print $1}')
+    cover_path="$CACHE_DIR/covers/${cover_hash}.jpg"
+    has_cover="false"
+    if [ ! -f "$cover_path" ]; then
+      ffmpeg -y -nostdin -loglevel quiet -i "$src" -an -vcodec mjpeg -vframes 1 "$cover_path" 2>/dev/null \
+        && [ -f "$cover_path" ] && has_cover="true" || rm -f "$cover_path"
+    else
+      has_cover="true"
+    fi
+    # Escape for JSON
+    esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+    printf '{"path":"%s","artist":"%s","album":"%s","title":"%s","cover":"%s","has_cover":%s}\n' \
+      "$(esc "$target")" "$(esc "$artist")" "$(esc "$album")" "$(esc "$title")" \
+      "$([ -f "$cover_path" ] && printf '%s' "$cover_path" || printf '')" "$has_cover"
+  done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+}
+
 cmd_diff() {
   # Machine-readable: <status>\t<relative-path> for every local song.
   # status = synced (on watch) | pending (not yet on watch)
@@ -568,6 +602,7 @@ ${B}flac2watch${X} — Musik per WLAN auf die Galaxy Watch syncen
   ${C}flac2watch status${X}           Status anzeigen
   ${C}flac2watch list${X}             Songs auf der Uhr auflisten
   ${C}flac2watch diff${X}             Sync-Status pro Song (synced/pending)
+  ${C}flac2watch meta${X}             Metadaten + Cover-Pfade als JSON (für die App)
   ${C}flac2watch launch${X}           Musik-Player auf der Uhr starten
   ${C}flac2watch player${X}           Player-Installationsseite auf der Uhr öffnen
   ${C}flac2watch config set${X} …     bitrate | mirror_delete | library ändern
@@ -594,6 +629,7 @@ case "${1:-}" in
   remove)      cmd_remove "${2:-}" ;;
   ping)        cmd_ping ;;
   diff)        cmd_diff ;;
+  meta)        cmd_meta ;;
   reconnect)   cmd_reconnect ;;
   launch)      cmd_launch ;;
   config)      cmd_config "${2:-}" "${3:-}" "${4:-}" ;;
