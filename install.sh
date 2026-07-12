@@ -14,7 +14,7 @@ PLIST_SRC="$REPO/launchd/com.lordhayne.flac2watch.plist"
 
 BIN_DIR="$HOME/.local/bin"
 BIN_DST="$BIN_DIR/flac2watch"
-APP_DIR="$HOME/Applications"
+APP_DIR="/Applications"
 APP_DST="$APP_DIR/FLAC2Watch.app"
 LIBRARY="$HOME/Music/WatchSync"
 LOG="$HOME/.cache/flac2watch/agent.log"   # agent stdout — getrennt vom CLI-Log

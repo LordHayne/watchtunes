@@ -10,6 +10,12 @@ import UniformTypeIdentifiers
 
 // MARK: - App state
 
+struct LibraryEntry: Identifiable, Hashable {
+    let id = UUID()
+    let path: String    // relative path, e.g. "Album/Song.mp3"
+    let synced: Bool    // true = on watch, false = pending
+}
+
 final class AppState: ObservableObject {
 
     static let shared = AppState()
@@ -46,6 +52,8 @@ final class AppState: ObservableObject {
     @Published var cliMissing = false
     @Published var watchSongs: [String] = []
     @Published var watchSongsCached = false
+    @Published var libraryDiff: [LibraryEntry] = []
+    @Published var libraryDiffLoading = false
     @Published var keepAwake = UserDefaults.standard.bool(forKey: "keepAwake") {
         didSet { UserDefaults.standard.set(keepAwake, forKey: "keepAwake") }
     }
@@ -53,6 +61,7 @@ final class AppState: ObservableObject {
     private var timer: Timer?
     private var pingTimer: Timer?
     private var pendingSync = false
+    private var wasReachable = false
     private let workQueue = DispatchQueue(label: "flac2watch.work")
 
     func start() {
@@ -139,9 +148,16 @@ final class AppState: ObservableObject {
             }
             if !s.reachable { s.watchCount = nil }
             DispatchQueue.main.async {
+                let justReconnected = !self.wasReachable && s.reachable
+                self.wasReachable = s.reachable
                 self.status = s
                 self.statusLoaded = true
                 self.refreshing = false
+                // Watch just came back online with pending songs → auto-sync
+                if justReconnected && s.pending > 0 && !self.syncing && !self.cliMissing {
+                    self.appendLog("Uhr wieder erreichbar — auto-sync …")
+                    self.sync()
+                }
             }
         }
     }
@@ -261,6 +277,22 @@ final class AppState: ObservableObject {
         }
     }
 
+    func reconnect() {
+        guard !cliMissing else { return }
+        appendLog("— Neu verbinden —")
+        refreshing = true
+        workQueue.async {
+            self.runCLI(["reconnect"]) { line in
+                let t = line.trimmingCharacters(in: .whitespaces)
+                if !t.isEmpty { self.appendLog(t) }
+            }
+            DispatchQueue.main.async {
+                self.refreshing = false
+                self.refresh()
+            }
+        }
+    }
+
     func loadWatchSongs() {
         workQueue.async {
             var lines: [String] = []
@@ -273,6 +305,25 @@ final class AppState: ObservableObject {
             DispatchQueue.main.async {
                 self.watchSongs = songs
                 self.watchSongsCached = cached
+            }
+        }
+    }
+
+    func loadDiff() {
+        libraryDiffLoading = true
+        workQueue.async {
+            var entries: [LibraryEntry] = []
+            self.runCLI(["diff"]) { line in
+                let parts = line.split(separator: "\t", maxSplits: 1)
+                guard parts.count == 2 else { return }
+                let status = String(parts[0])
+                let path = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                guard !path.isEmpty else { return }
+                entries.append(LibraryEntry(path: path, synced: status == "synced"))
+            }
+            DispatchQueue.main.async {
+                self.libraryDiff = entries
+                self.libraryDiffLoading = false
             }
         }
     }
@@ -369,6 +420,7 @@ struct ContentView: View {
     @State private var showPair = false
     @State private var showSettings = false
     @State private var showSongs = false
+    @State private var showLibrary = false
 
     var body: some View {
         VStack(spacing: 14) {
@@ -392,6 +444,7 @@ struct ContentView: View {
         .sheet(isPresented: $showPair) { PairSheet().environmentObject(state) }
         .sheet(isPresented: $showSettings) { SettingsSheet().environmentObject(state) }
         .sheet(isPresented: $showSongs) { SongsSheet().environmentObject(state) }
+        .sheet(isPresented: $showLibrary) { LibrarySheet().environmentObject(state) }
     }
 
     private var windowBackground: some View {
@@ -476,6 +529,16 @@ struct ContentView: View {
                 .buttonStyle(.plain)
                 .help("Player auf der Uhr starten")
             }
+            if state.statusLoaded && state.status.paired && !state.status.reachable {
+                Button { state.reconnect() } label: {
+                    Image(systemName: "arrow.triangle.2.circlepath.circle")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Neu verbinden")
+                .disabled(state.refreshing)
+            }
             Button { showSettings = true } label: {
                 Image(systemName: "gearshape")
                     .font(.system(size: 15))
@@ -493,7 +556,14 @@ struct ContentView: View {
     private var pills: some View {
         VStack(spacing: 8) {
             HStack(spacing: 8) {
-                pill("music.note.list", "\(state.status.localCount) lokal", Theme.violet)
+                Button {
+                    state.loadDiff()
+                    showLibrary = true
+                } label: {
+                    pill("music.note.list", "\(state.status.localCount) lokal", Theme.violet)
+                }
+                .buttonStyle(.plain)
+                .help("Bibliothek anzeigen — was ist synced, was fehlt")
                 if let w = state.status.watchCount {
                     Button {
                         state.loadWatchSongs()
@@ -771,6 +841,101 @@ struct SongsSheet: View {
     }
 }
 
+// MARK: - Library overview (synced / pending)
+
+struct LibrarySheet: View {
+    @EnvironmentObject var state: AppState
+    @Environment(\.dismiss) private var dismiss
+
+    private var syncedCount: Int { state.libraryDiff.filter { $0.synced }.count }
+    private var pendingCount: Int { state.libraryDiff.filter { !$0.synced }.count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Bibliothek")
+                    .font(.system(size: 16, weight: .bold, design: .rounded))
+                Spacer()
+                HStack(spacing: 8) {
+                    pill("checkmark.circle.fill", "\(syncedCount) synced", .green)
+                    pill("clock.fill", "\(pendingCount) pending", .orange)
+                }
+            }
+
+            if state.libraryDiffLoading {
+                ProgressView().frame(maxWidth: .infinity, minHeight: 120)
+            } else if state.libraryDiff.isEmpty {
+                Text("Bibliothek leer — Musik in den Ordner legen oder hierher ziehen.")
+                    .foregroundStyle(.tertiary)
+                    .frame(maxWidth: .infinity, minHeight: 120)
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 2) {
+                        ForEach(state.libraryDiff) { entry in
+                            diffRow(entry)
+                        }
+                    }
+                }
+                .frame(height: 340)
+                .background(RoundedRectangle(cornerRadius: 12).fill(.black.opacity(0.25)))
+            }
+
+            HStack {
+                Button {
+                    state.openLibrary()
+                } label: {
+                    Label("Ordner öffnen", systemImage: "folder")
+                }
+                .buttonStyle(.glass)
+                Spacer()
+                Button("Schließen") { dismiss() }
+                    .buttonStyle(.glassProminent)
+                    .tint(Theme.violet)
+            }
+        }
+        .padding(18)
+        .frame(width: 440)
+        .preferredColorScheme(.dark)
+        .onAppear { state.loadDiff() }
+    }
+
+    private func pill(_ icon: String, _ text: String, _ tint: Color) -> some View {
+        HStack(spacing: 5) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(tint)
+            Text(text).font(.caption)
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 6)
+        .glassEffect(.regular, in: .capsule)
+    }
+
+    private func diffRow(_ entry: LibraryEntry) -> some View {
+        let name = (entry.path as NSString).lastPathComponent
+        let folder = (entry.path as NSString).deletingLastPathComponent
+        return HStack(spacing: 8) {
+            Image(systemName: entry.synced ? "checkmark.circle.fill" : "clock.fill")
+                .font(.system(size: 11))
+                .foregroundStyle(entry.synced ? .green : .orange)
+            VStack(alignment: .leading, spacing: 1) {
+                Text((name as NSString).deletingPathExtension)
+                    .font(.system(size: 12))
+                    .lineLimit(1)
+                if !folder.isEmpty {
+                    Text(folder)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+    }
+}
+
 // MARK: - Settings
 
 struct SettingsSheet: View {
@@ -779,6 +944,7 @@ struct SettingsSheet: View {
     @State private var bitrate = "320k"
     @State private var mirror = true
     @State private var loaded = false
+    @State private var showPair = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -823,6 +989,25 @@ struct SettingsSheet: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
 
+            Divider()
+
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Uhr-Kopplung")
+                    Text(verbatim: state.status.paired
+                         ? "Gekoppelt: ja"
+                         : "Noch nicht gekoppelt")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+                Button("Neu koppeln") { showPair = true }
+                    .buttonStyle(.glass)
+            }
+            Text("Wenn die Uhr sich nicht mehr verbindet: Drahtloses Debugging auf der Uhr reaktivieren und neu koppeln.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+
             HStack {
                 Spacer()
                 Button("Fertig") { dismiss() }
@@ -844,6 +1029,7 @@ struct SettingsSheet: View {
         .onChange(of: mirror) {
             if loaded { state.setConfig("mirror_delete", mirror ? "true" : "false") }
         }
+        .sheet(isPresented: $showPair) { PairSheet().environmentObject(state) }
     }
 }
 
@@ -962,6 +1148,8 @@ struct MenuBarContent: View {
             .disabled(state.syncing || state.cliMissing)
         Button("Player auf der Uhr öffnen") { state.launchPlayer() }
             .disabled(!state.status.reachable)
+        Button("Neu verbinden") { state.reconnect() }
+            .disabled(state.refreshing || state.cliMissing || !state.status.paired)
         Button("Musik-Ordner öffnen") { state.openLibrary() }
         Divider()
         Button("Fenster öffnen") {

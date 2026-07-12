@@ -468,12 +468,58 @@ cmd_remove() { # <rel target.mp3> — delete one song from the watch
   ok "Von der Uhr entfernt: $target"
 }
 
+cmd_reconnect() {
+  require adb android-platform-tools || exit 1
+  # Disconnect stale connections, restart adb server, then discover fresh.
+  local old
+  old="$LAST_ENDPOINT"
+  [ -n "$old" ] && adb disconnect "$old" </dev/null >/dev/null 2>&1 || true
+  # Drop all existing device connections so discovery starts clean.
+  while IFS= read -r serial; do
+    adb disconnect "$serial" </dev/null >/dev/null 2>&1 || true
+  done < <(adb devices 2>/dev/null | awk 'NR>1 && $1 ~ /:/ {print $1}')
+  adb kill-server >/dev/null 2>&1 || true
+  adb start-server >/dev/null 2>&1 || true
+  local endpoint
+  if endpoint=$(discover_watch); then
+    ok "Neu verbunden: $endpoint"
+    log "reconnected: $endpoint"
+  else
+    warn "Uhr nicht gefunden — Display wecken und erneut versuchen."
+    log "reconnect failed: watch not found"
+    exit 1
+  fi
+}
+
 cmd_ping() {
   # Cheap reachability check / keep-awake tick for the app.
   require adb android-platform-tools || exit 1
   local endpoint
   endpoint=$(discover_watch) || exit 1
   adb -s "$endpoint" shell true </dev/null >/dev/null 2>&1
+}
+
+cmd_diff() {
+  # Machine-readable: <status>\t<relative-path> for every local song.
+  # status = synced (on watch) | pending (not yet on watch)
+  # Uses cached on_watch.list when watch is offline.
+  local ow="$CACHE_DIR/on_watch.list"
+  # Try to get a fresh watch list if reachable (non-fatal if offline)
+  local endpoint
+  if endpoint=$(discover_watch 2>/dev/null); then
+    fetch_watch_list "$endpoint" || true
+  fi
+  if [ ! -f "$ow" ]; then : >"$ow"; fi
+  local src rel target
+  while IFS= read -r -d '' src; do
+    rel="${src#"$LIBRARY"/}"
+    target="${rel%.*}.mp3"
+    if grep -Fxq "$target" "$ow"; then
+      printf 'synced\t%s\n' "$target"
+    else
+      printf 'pending\t%s\n' "$target"
+    fi
+  done < <(find "$LIBRARY" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
 }
 
 cmd_launch() {
@@ -521,9 +567,11 @@ ${B}flac2watch${X} — Musik per WLAN auf die Galaxy Watch syncen
   ${C}flac2watch sync${X} [--notify]  Konvertieren + alles Fehlende auf die Uhr pushen
   ${C}flac2watch status${X}           Status anzeigen
   ${C}flac2watch list${X}             Songs auf der Uhr auflisten
+  ${C}flac2watch diff${X}             Sync-Status pro Song (synced/pending)
   ${C}flac2watch launch${X}           Musik-Player auf der Uhr starten
   ${C}flac2watch player${X}           Player-Installationsseite auf der Uhr öffnen
   ${C}flac2watch config set${X} …     bitrate | mirror_delete | library ändern
+  ${C}flac2watch reconnect${X}        Verbindung zur Uhr trennen und neu aufbauen
   ${C}flac2watch doctor${X}           Voraussetzungen prüfen
   ${C}flac2watch open${X}             Musik-Ordner im Finder öffnen
 
@@ -545,6 +593,8 @@ case "${1:-}" in
   list)        cmd_list ;;
   remove)      cmd_remove "${2:-}" ;;
   ping)        cmd_ping ;;
+  diff)        cmd_diff ;;
+  reconnect)   cmd_reconnect ;;
   launch)      cmd_launch ;;
   config)      cmd_config "${2:-}" "${3:-}" "${4:-}" ;;
   status)      cmd_status "${2:-}" ;;
