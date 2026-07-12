@@ -97,7 +97,7 @@ final class AppState: ObservableObject {
         // the screen turns off, which kills the adb connection.
         pingTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             guard let self, self.status.reachable, !self.syncing else { return }
-            self.workQueue.async { self.runCLI(["ping"]) }
+DispatchQueue.global().async { self.runCLI(["ping"]) }
         }
     }
 
@@ -144,7 +144,7 @@ final class AppState: ObservableObject {
     func refresh() {
         guard !cliMissing, !refreshing else { return }
         refreshing = true
-        workQueue.async {
+        DispatchQueue.global().async {
             var lines: [String] = []
             self.runCLI(["status", "--porcelain"]) { lines.append($0) }
             var s = Status()
@@ -196,7 +196,7 @@ final class AppState: ObservableObject {
         if syncing { pendingSync = true; return }
         syncing = true
         appendLog("— Sync gestartet —")
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["sync", "--progress"]) { line in
                 if line.hasPrefix("TOTAL ") {
                     let n = Int(line.dropFirst(6).trimmingCharacters(in: .whitespaces)) ?? 0
@@ -234,7 +234,7 @@ final class AppState: ObservableObject {
         guard !urls.isEmpty else { return }
         let libPath = status.libraries.first ?? (NSHomeDirectory() + "/Music/WatchSync")
         let libURL = URL(fileURLWithPath: libPath, isDirectory: true)
-        workQueue.async {
+        DispatchQueue.global().async {
             let fm = FileManager.default
             try? fm.createDirectory(at: libURL, withIntermediateDirectories: true)
             let libResolved = libURL.standardizedFileURL.resolvingSymlinksInPath().path
@@ -274,7 +274,7 @@ final class AppState: ObservableObject {
     }
 
     func pair(addr: String, code: String, completion: @escaping (Bool) -> Void) {
-        workQueue.async {
+        DispatchQueue.global().async {
             let rc = self.runCLI(["pair", addr, code]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -288,7 +288,7 @@ final class AppState: ObservableObject {
 
     func installPlayer() {
         appendLog("Öffne Play-Store-Seite auf der Uhr …")
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["player"]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -297,7 +297,7 @@ final class AppState: ObservableObject {
     }
 
     func launchPlayer() {
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["launch"]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -309,7 +309,7 @@ final class AppState: ObservableObject {
         guard !cliMissing else { return }
         appendLog("— Neu verbinden —")
         refreshing = true
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["reconnect"]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -324,7 +324,7 @@ final class AppState: ObservableObject {
     func disconnect() {
         guard !cliMissing else { return }
         appendLog("— Verbindung getrennt —")
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["disconnect"]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -341,8 +341,25 @@ final class AppState: ObservableObject {
         }
     }
 
+    func discover(completion: @escaping ([(name: String, endpoint: String)]) -> Void) {
+        DispatchQueue.global().async {
+            var watches: [(name: String, endpoint: String)] = []
+            self.runCLI(["discover"]) { line in
+                let parts = line.split(separator: "\t", maxSplits: 1)
+                if parts.count == 2 {
+                    let name = String(parts[0]).trimmingCharacters(in: .whitespaces)
+                    let endpoint = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                    if !name.isEmpty && !endpoint.isEmpty && endpoint != "unknown" {
+                        watches.append((name: name, endpoint: endpoint))
+                    }
+                }
+            }
+            DispatchQueue.main.async { completion(watches) }
+        }
+    }
+
     func loadWatchSongs() {
-        workQueue.async {
+        DispatchQueue.global().async {
             var lines: [String] = []
             self.runCLI(["list"]) { lines.append($0) }
             var cached = false
@@ -361,7 +378,7 @@ final class AppState: ObservableObject {
 
     func loadScan() {
         scanLoading = true
-        workQueue.async {
+        DispatchQueue.global().async {
             var songs: [ScannedSong] = []
             self.runCLI(["scan"]) { line in
                 guard let data = line.data(using: .utf8),
@@ -408,10 +425,53 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Force a fresh re-scan (ignores cache, re-reads all files with ffprobe).
+    func refreshScan() {
+        scanLoading = true
+        DispatchQueue.global().async {
+            var songs: [ScannedSong] = []
+            self.runCLI(["scan", "--fresh"]) { line in
+                guard let data = line.data(using: .utf8),
+                      let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+                let lib = obj["library"] as? String ?? ""
+                let rel = obj["rel"] as? String ?? ""
+                let abs = obj["abs"] as? String ?? ""
+                guard !rel.isEmpty else { return }
+                let libName = (lib as NSString).lastPathComponent
+                songs.append(ScannedSong(
+                    library: lib, libraryName: libName, relPath: rel, absPath: abs,
+                    artist: obj["artist"] as? String ?? "",
+                    album: obj["album"] as? String ?? "",
+                    title: obj["title"] as? String ?? "",
+                    coverPath: obj["cover"] as? String ?? "",
+                    hasCover: obj["has_cover"] as? Bool ?? false,
+                    synced: false
+                ))
+            }
+            let owPath = NSHomeDirectory() + "/.cache/watchtunes/on_watch.list"
+            let watchSet: Set<String>
+            if let content = try? String(contentsOfFile: owPath, encoding: .utf8) {
+                watchSet = Set(content.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+            } else {
+                watchSet = []
+            }
+            let finalSongs = songs.map { song -> ScannedSong in
+                ScannedSong(library: song.library, libraryName: song.libraryName, relPath: song.relPath,
+                            absPath: song.absPath, artist: song.artist, album: song.album,
+                            title: song.title, coverPath: song.coverPath, hasCover: song.hasCover,
+                            synced: watchSet.contains(song.relPath))
+            }
+            DispatchQueue.main.async {
+                self.scannedSongs = finalSongs
+                self.scanLoading = false
+            }
+        }
+    }
+
     // MARK: - Folder management
 
     func addFolder(_ path: String) {
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["addfolder", path]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -424,7 +484,7 @@ final class AppState: ObservableObject {
     }
 
     func rmFolder(_ path: String) {
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["rmfolder", path]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -503,7 +563,7 @@ final class AppState: ObservableObject {
     /// deleted directly.
     func removeSong(_ song: ScannedSong) {
         scannedSongs.removeAll { $0.id == song.id }
-        workQueue.async {
+        DispatchQueue.global().async {
             let fm = FileManager.default
             if (try? fm.trashItem(at: URL(fileURLWithPath: song.absPath), resultingItemURL: nil)) != nil {
                 self.appendLog("In den Papierkorb: \(song.title.isEmpty ? song.relPath : song.title)")
@@ -517,7 +577,7 @@ final class AppState: ObservableObject {
     }
 
     func setConfig(_ key: String, _ value: String) {
-        workQueue.async {
+        DispatchQueue.global().async {
             self.runCLI(["config", "set", key, value]) { line in
                 let t = line.trimmingCharacters(in: .whitespaces)
                 if !t.isEmpty { self.appendLog(t) }
@@ -1426,6 +1486,8 @@ struct PairSheet: View {
     @State private var code = ""
     @State private var busy = false
     @State private var failed = false
+    @State private var discovering = false
+    @State private var discoveredWatches: [(name: String, endpoint: String)] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -1448,6 +1510,59 @@ struct PairSheet: View {
             """)
             .font(.caption)
             .foregroundStyle(.secondary)
+
+            // Auto-discover section
+            if discoveredWatches.isEmpty {
+                Button {
+                    discoverWatches()
+                } label: {
+                    Label(discovering ? "Suche …" : "Uhr im Netzwerk suchen",
+                          systemImage: discovering ? "magnifyingglass" : "antenna.radiowaves.left.and.right")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .disabled(discovering)
+            } else {
+                Text("Gefundene Uhren:")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                ForEach(discoveredWatches.indices, id: \.self) { idx in
+                    let watch = discoveredWatches[idx]
+                    Button {
+                        addr = watch.endpoint
+                    } label: {
+                        HStack {
+                            Image(systemName: "applewatch.radiowaves.left.and.right")
+                                .font(.system(size: 12))
+                                .foregroundStyle(Theme.cyan)
+                            Text(watch.name)
+                                .font(.system(size: 11))
+                            Spacer()
+                            Text(watch.endpoint)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                            if addr == watch.endpoint {
+                                Image(systemName: "checkmark.circle.fill")
+                                    .font(.system(size: 12))
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .glassEffect(.regular, in: .rect(cornerRadius: 8))
+                    }
+                    .buttonStyle(.plain)
+                }
+                Button {
+                    discoveredWatches = []
+                    discoverWatches()
+                } label: {
+                    Label("Erneut suchen", systemImage: "arrow.clockwise")
+                        .font(.caption)
+                }
+                .buttonStyle(.plain)
+                .disabled(discovering)
+            }
 
             TextField("IP:Port (z. B. 192.168.1.77:46151)", text: $addr)
             TextField("6-stelliger Code", text: $code)
@@ -1478,9 +1593,20 @@ struct PairSheet: View {
             }
         }
         .padding(20)
-        .frame(width: 380)
+        .frame(width: 400)
         .textFieldStyle(.roundedBorder)
         .preferredColorScheme(.dark)
+    }
+
+    private func discoverWatches() {
+        discovering = true
+        state.discover { watches in
+            discoveredWatches = watches
+            discovering = false
+            if watches.count == 1 && addr.isEmpty {
+                addr = watches[0].endpoint
+            }
+        }
     }
 }
 

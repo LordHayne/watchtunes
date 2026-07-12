@@ -250,40 +250,84 @@ mp3_for() {
 # Scan all libraries, output one JSON line per song.
 # Format: {"library":"/path","rel":"library_name/Album/Song.mp3","abs":"/full/path/to/source.flac","artist":"...","album":"...","title":"...","cover":"/path/to/cover.jpg","has_cover":true}
 cmd_scan() {
+  # Scan all libraries, output JSON per song. Caches to scan.json for fast startup.
+  # Usage: watchtunes scan [--fresh]  (—fresh forces re-scan, ignores cache)
+  # Cover extraction is deferred to 'watchtunes cover <rel>' (on-demand) for speed.
+  local fresh=false
+  [ "${2:-}" = "--fresh" ] && fresh=true
+  local cache="$CACHE_DIR/scan.json"
+
+  # Serve from cache if it exists and not --fresh
+  if ! $fresh && [ -f "$cache" ]; then
+    cat "$cache"
+    return 0
+  fi
+
   mkdir -p "$CACHE_DIR/covers"
-  local lib lname src rel target artist album title cover_hash cover_path has_cover
+  local lib lname
+  : >"$cache.tmp"
   for lib in "${LIBRARIES[@]}"; do
     [ -d "$lib" ] || continue
     lname="$(lib_name "$lib")"
+    # Parallel scan: pipe find output to xargs -P for concurrent ffprobe calls
+    find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null | \
     while IFS= read -r -d '' src; do
       rel="${src#"$lib"/}"
       target="$lname/$rel"
-      target="${target%.*}.mp3"   # normalize extension to .mp3
-      # Extract metadata via ffprobe
-      artist=$(ffprobe -v quiet -show_entries format_tags=artist,ARTIST -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
-      album=$(ffprobe -v quiet -show_entries format_tags=album,ALBUM -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
-      title=$(ffprobe -v quiet -show_entries format_tags=title,TITLE -of csv=p=0 "$src" 2>/dev/null | head -1 | tr -d '\r')
+      target="${target%.*}.mp3"
+      tags=$(ffprobe -v quiet -show_entries format_tags=artist,ARTIST,album,ALBUM,title,TITLE -of csv=p=0 "$src" 2>/dev/null | tr -d '\r')
+      artist=$(echo "$tags" | head -1)
+      album=$(echo "$tags" | sed -n '2p')
+      title=$(echo "$tags" | sed -n '3p')
       [ -z "$artist" ] && artist=""
       [ -z "$album" ] && album=""
       [ -z "$title" ] && title=""
-      # Extract cover if present
       cover_hash=$(printf '%s' "$target" | md5 -q 2>/dev/null || printf '%s' "$target" | md5sum 2>/dev/null | awk '{print $1}')
       cover_path="$CACHE_DIR/covers/${cover_hash}.jpg"
-      has_cover="false"
-      if [ ! -f "$cover_path" ]; then
-        ffmpeg -y -nostdin -loglevel quiet -i "$src" -an -vcodec mjpeg -vframes 1 "$cover_path" 2>/dev/null \
-          && [ -f "$cover_path" ] && has_cover="true" || rm -f "$cover_path"
-      else
-        has_cover="true"
-      fi
-      # Escape for JSON
+      if [ -f "$cover_path" ]; then has_cover="true"; else has_cover="false"; fi
       esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
       printf '{"library":"%s","rel":"%s","abs":"%s","artist":"%s","album":"%s","title":"%s","cover":"%s","has_cover":%s}\n' \
         "$(esc "$lib")" "$(esc "$target")" "$(esc "$src")" \
         "$(esc "$artist")" "$(esc "$album")" "$(esc "$title")" \
-        "$([ -f "$cover_path" ] && printf '%s' "$cover_path" || printf '')" "$has_cover"
-    done < <(find "$lib" -type f \( -iname '*.flac' -o -iname '*.mp3' -o -iname '*.m4a' \) -print0 2>/dev/null)
+        "$([ -f "$cover_path" ] && printf '%s' "$cover_path" || printf '')" "$has_cover" >>"$cache.tmp"
+    done
   done
+  mv "$cache.tmp" "$cache"
+  cat "$cache"
+}
+
+cmd_cover() {
+  # Extract cover for a single song on-demand.
+  # Usage: watchtunes cover <rel_path>  (rel_path = library_name/Album/Song.mp3)
+  # Outputs the cover path if successful, empty if no cover.
+  local target="${1:-}"
+  [ -z "$target" ] && return 1
+  mkdir -p "$CACHE_DIR/covers"
+  local cover_hash cover_path src=""
+  cover_hash=$(printf '%s' "$target" | md5 -q 2>/dev/null || printf '%s' "$target" | md5sum 2>/dev/null | awk '{print $1}')
+  cover_path="$CACHE_DIR/covers/${cover_hash}.jpg"
+  # Already cached?
+  if [ -f "$cover_path" ]; then
+    printf '%s\n' "$cover_path"
+    return 0
+  fi
+  # Find the source file
+  for lib in "${LIBRARIES[@]}"; do
+    local lname; lname="$(lib_name "$lib")"
+    case "$target" in
+      "$lname"/*)
+        local stem; stem="${target#"$lname"/}"
+        stem="${stem%.*}"
+        for ext in flac mp3 m4a FLAC MP3 M4A; do
+          if [ -f "$lib/$stem.$ext" ]; then src="$lib/$stem.$ext"; break; fi
+        done
+        ;;
+    esac
+    [ -n "$src" ] && break
+  done
+  [ -z "$src" ] && return 1
+  ffmpeg -y -nostdin -loglevel quiet -i "$src" -an -vcodec mjpeg -vframes 1 "$cover_path" 2>/dev/null \
+    && [ -f "$cover_path" ] && printf '%s\n' "$cover_path" || { rm -f "$cover_path"; return 1; }
 }
 
 # --- folder management commands ---------------------------------------------
@@ -356,7 +400,19 @@ cmd_pair() {
     printf "Kopplungscode (6-stellig):          "; read -r code
     say ""
   fi
-  if ! adb pair "$addr" "$code"; then
+  # Timeout: adb pair can hang if the watch is already connected or code is wrong
+  local pair_out
+  pair_out=$(perl -e '
+    use POSIX ":sys_wait_h";
+    my $pid = fork();
+    if ($pid == 0) { exec @ARGV; }
+    alarm(15);
+    while (waitpid($pid, 0) == 0) {}
+    kill("KILL", $pid) if kill(0, $pid);
+    exit($? >> 8);
+  ' adb pair "$addr" "$code" 2>&1) || true
+  echo "$pair_out"
+  if ! echo "$pair_out" | grep -qi 'success'; then
     err "Kopplung fehlgeschlagen. Code/Port ändern sich — Bildschirm offen lassen und neu versuchen."
     exit 1
   fi
@@ -655,6 +711,27 @@ cmd_disconnect() {
   log "disconnected by user"
 }
 
+cmd_discover() {
+  # Scan for watches in pairing mode via adb mdns.
+  # Output: one line per found watch: <name>\t<ip:port>
+  require adb android-platform-tools || exit 1
+  adb start-server >/dev/null 2>&1
+  local name type endpoint found=0
+  local try
+  for try in 1 2 3 4 5; do
+    while IFS=$'\t' read -r name type endpoint; do
+      [ -z "$name" ] && continue
+      case "$type" in
+        *_adb-tls-pairing._tcp*)
+          [ -n "$endpoint" ] && { printf '%s\t%s\n' "$name" "$endpoint"; found=1; }
+          ;;
+      esac
+    done < <(adb mdns services 2>/dev/null | awk -F'\t' 'NR>1 && NF>=3 {print $1"\t"$2"\t"$3}')
+    [ "$found" = "1" ] && return 0
+    sleep 1
+  done
+}
+
 cmd_reconnect() {
   require adb android-platform-tools || exit 1
   # Disconnect stale connections, restart adb server, then discover fresh.
@@ -826,6 +903,7 @@ ${B}watchtunes${X} — Musik per WLAN auf die Galaxy Watch syncen
   ${C}watchtunes config set${X} …     bitrate | mirror_delete | library ändern
   ${C}watchtunes reconnect${X}        Verbindung zur Uhr trennen und neu aufbauen
   ${C}watchtunes disconnect${X}       Verbindung zur Uhr trennen
+  ${C}watchtunes discover${X}       Nach Uhren im Netzwerk suchen (Pairing-Modus)
   ${C}watchtunes doctor${X}           Voraussetzungen prüfen
   ${C}watchtunes open${X}             Musik-Ordner im Finder öffnen
 
@@ -852,12 +930,14 @@ case "${1:-}" in
   ping)        cmd_ping ;;
   diff)        cmd_diff ;;
   meta)        cmd_meta ;;
-  scan)        cmd_scan ;;
+  scan)        cmd_scan "$@" ;;
+  cover)       cmd_cover "${2:-}" ;;
   folders)     cmd_folders ;;
   addfolder)   cmd_addfolder "${2:-}" ;;
   rmfolder)    cmd_rmfolder "${2:-}" ;;
   reconnect)   cmd_reconnect ;;
   disconnect)  cmd_disconnect ;;
+  discover)    cmd_discover ;;
   launch)      cmd_launch ;;
   config)      cmd_config "${2:-}" "${3:-}" "${4:-}" ;;
   status)      cmd_status "${2:-}" ;;
